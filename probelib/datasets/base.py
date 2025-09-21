@@ -46,6 +46,7 @@ class DialogueDataset(ABC):
         labels: list[Label] | None = None,
         metadata: dict[str, list[Any]] | None = None,
         shuffle_upon_init: bool = True,
+        shuffle_seed: int | None = 42,
         **kwargs,
     ):
         """
@@ -69,6 +70,12 @@ class DialogueDataset(ABC):
         self.dialogues = dialogues
         self.labels = labels
         self.metadata = metadata
+        self._shuffle_seed = shuffle_seed
+        self._shuffle_rng = (
+            np.random.default_rng(shuffle_seed)
+            if shuffle_seed is not None
+            else np.random.default_rng()
+        )
 
         self.post_process()
 
@@ -94,8 +101,7 @@ class DialogueDataset(ABC):
 
     def randomly_shuffle_dialogues(self) -> None:
         """Randomly shuffle dialogues, labels, and metadata."""
-        np.random.seed(42)
-        perm = np.random.permutation(len(self))
+        perm = self._shuffle_rng.permutation(len(self))
 
         self.dialogues = [self.dialogues[i] for i in perm]
         self.labels = [self.labels[i] for i in perm]
@@ -129,6 +135,7 @@ class DialogueDataset(ABC):
             labels=labels,
             metadata=metadata,
             shuffle_upon_init=False,
+            shuffle_seed=self._shuffle_seed,
         )
         new_dataset.base_name = self.base_name
 
@@ -169,6 +176,7 @@ class DialogueDataset(ABC):
             labels=labels,
             metadata=metadata,
             shuffle_upon_init=False,
+            shuffle_seed=self._shuffle_seed,
         )
         new_dataset.base_name = self.base_name
 
@@ -194,6 +202,7 @@ class DialogueDataset(ABC):
             labels=labels,
             metadata=metadata,
             shuffle_upon_init=True,
+            shuffle_seed=self._shuffle_seed,
         )
         new_dataset.base_name = new_base_name
 
@@ -237,6 +246,7 @@ class DialogueDataset(ABC):
             labels=first_labels,
             metadata=first_metadata,
             shuffle_upon_init=shuffle,
+            shuffle_seed=self._shuffle_seed,
         )
         first_split.base_name = self.base_name
 
@@ -245,6 +255,7 @@ class DialogueDataset(ABC):
             labels=second_labels,
             metadata=second_metadata,
             shuffle_upon_init=shuffle,
+            shuffle_seed=self._shuffle_seed,
         )
         second_split.base_name = self.base_name
 

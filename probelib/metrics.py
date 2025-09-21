@@ -118,13 +118,11 @@ def with_bootstrap(
         def wrapped(
             y_true: np.ndarray, y_pred_proba: np.ndarray, **kwargs
         ) -> tuple[float, float, float]:
-            # Set random state if provided
-            if random_state is not None:
-                np.random.seed(random_state)
-
             # Ensure numpy arrays
             y_true = _ensure_numpy(y_true)
             y_pred_proba = _ensure_numpy(y_pred_proba)
+
+            rng = np.random.default_rng(random_state)
 
             # Compute point estimate
             point_estimate = metric_fn(y_true, y_pred_proba, **kwargs)
@@ -135,7 +133,7 @@ def with_bootstrap(
 
             for _ in range(n_bootstrap):
                 # Sample with replacement
-                indices = np.random.choice(n_samples, size=n_samples, replace=True)
+                indices = rng.choice(n_samples, size=n_samples, replace=True)
                 y_true_boot = y_true[indices]
                 y_pred_boot = (
                     y_pred_proba[indices]
@@ -171,6 +169,12 @@ def with_bootstrap(
 
         wrapped.__name__ = metric_fn.__name__  # type: ignore
         wrapped.__doc__ = metric_fn.__doc__  # type: ignore
+        wrapped._probelib_bootstrap = True  # type: ignore[attr-defined]
+        wrapped._probelib_bootstrap_config = {
+            "n_bootstrap": n_bootstrap,
+            "confidence_level": confidence_level,
+            "random_state": random_state,
+        }  # type: ignore[attr-defined]
 
         return wrapped
 
@@ -182,7 +186,6 @@ def with_bootstrap(
 # ============================================================================
 
 
-@with_bootstrap()
 def auroc(y_true: np.ndarray, y_pred_proba: np.ndarray) -> float:
     """Area Under the Receiver Operating Characteristic curve.
 
@@ -211,7 +214,6 @@ def auroc(y_true: np.ndarray, y_pred_proba: np.ndarray) -> float:
     return float(roc_auc_score(y_true, proba))
 
 
-@with_bootstrap()
 def partial_auroc(
     y_true: np.ndarray, y_pred_proba: np.ndarray, max_fpr: float = 0.1
 ) -> float:
@@ -242,7 +244,6 @@ def partial_auroc(
     return float(roc_auc_score(y_true, proba, max_fpr=max_fpr))
 
 
-@with_bootstrap()
 def accuracy(
     y_true: np.ndarray, y_pred_proba: np.ndarray, threshold: float = 0.5
 ) -> float:
@@ -268,7 +269,6 @@ def accuracy(
     return float(accuracy_score(y_true, y_pred))
 
 
-@with_bootstrap()
 def balanced_accuracy(
     y_true: np.ndarray, y_pred_proba: np.ndarray, threshold: float = 0.5
 ) -> float:
@@ -294,7 +294,6 @@ def balanced_accuracy(
     return float(balanced_accuracy_score(y_true, y_pred))
 
 
-@with_bootstrap()
 def precision(
     y_true: np.ndarray, y_pred_proba: np.ndarray, threshold: float = 0.5
 ) -> float:
@@ -320,7 +319,6 @@ def precision(
     return float(precision_score(y_true, y_pred, zero_division=0.0))
 
 
-@with_bootstrap()
 def recall(
     y_true: np.ndarray, y_pred_proba: np.ndarray, threshold: float = 0.5
 ) -> float:
@@ -346,7 +344,6 @@ def recall(
     return float(recall_score(y_true, y_pred, zero_division=0.0))
 
 
-@with_bootstrap()
 def f1(y_true: np.ndarray, y_pred_proba: np.ndarray, threshold: float = 0.5) -> float:
     """F1 score (harmonic mean of precision and recall).
 
@@ -375,7 +372,6 @@ def f1(y_true: np.ndarray, y_pred_proba: np.ndarray, threshold: float = 0.5) -> 
 # ============================================================================
 
 
-@with_bootstrap()
 def recall_at_fpr(
     y_true: np.ndarray, y_pred_proba: np.ndarray, fpr: float = 0.05
 ) -> float:
@@ -429,7 +425,6 @@ def recall_at_fpr(
     return float(n_detected / len(pos_scores))
 
 
-@with_bootstrap()
 def tpr_at_fpr(
     y_true: np.ndarray, y_pred_proba: np.ndarray, fpr: float = 0.05
 ) -> float:
@@ -478,7 +473,6 @@ def tpr_at_fpr(
 # ============================================================================
 
 
-@with_bootstrap()
 def fpr_at_threshold(
     y_true: np.ndarray, y_pred_proba: np.ndarray, threshold: float = 0.5
 ) -> float:
@@ -514,7 +508,6 @@ def fpr_at_threshold(
     return float(np.mean(neg_scores > threshold))
 
 
-@with_bootstrap()
 def fpr(y_true: np.ndarray, y_pred_proba: np.ndarray) -> float:
     """False positive rate at default threshold (0.5).
 

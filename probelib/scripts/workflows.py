@@ -159,6 +159,7 @@ def evaluate_probes(
     batch_size: int = 32,
     streaming: bool = True,
     metrics: list[Callable | str] | None = None,
+    bootstrap: bool | dict[str, Any] | None = None,
     verbose: bool = True,
     **activation_kwargs: Any,
 ) -> tuple[PredictionsOutput, MetricsOutput]:
@@ -173,6 +174,9 @@ def evaluate_probes(
         labels: Ground truth labels for evaluation
         batch_size: Batch size for activation collection
         metrics: List of metric functions or names (defaults to standard set)
+        bootstrap: ``None`` (default) disables bootstrap; pass ``True`` to apply
+            default bootstrap settings or a dict of keyword arguments accepted by
+            :func:`probelib.metrics.with_bootstrap` for customisation.
         verbose: Whether to show progress bars
         **activation_kwargs: Additional args passed to collect_activations
 
@@ -234,6 +238,12 @@ def evaluate_probes(
                 converted_metrics.append(metric)
         metrics = converted_metrics
 
+    # Normalise bootstrap configuration
+    if isinstance(bootstrap, bool):
+        bootstrap_kwargs: dict[str, Any] | None = {} if bootstrap else None
+    else:
+        bootstrap_kwargs = bootstrap
+
     # 4. Determine all required layers
     all_layers = set()
     for probe in probes.values():
@@ -260,7 +270,7 @@ def evaluate_probes(
     if isinstance(activations, ActivationIterator):
         # Streaming mode
         all_predictions, all_metrics = _evaluate_probes_streaming(
-            probes, activations, labels_tensor, metrics
+            probes, activations, labels_tensor, metrics, bootstrap_kwargs
         )
     else:
         # In-memory mode
@@ -277,7 +287,7 @@ def evaluate_probes(
             activations = filtered_acts
 
         all_predictions, all_metrics = _evaluate_probes_batch(
-            probes, activations, labels_tensor, metrics
+            probes, activations, labels_tensor, metrics, bootstrap_kwargs
         )
 
     # 7. Return in same format as input
@@ -292,6 +302,7 @@ def _evaluate_probes_batch(
     activations: Activations,
     labels: torch.Tensor,
     metrics: list[Callable],
+    bootstrap_kwargs: dict[str, Any] | None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, MetricsDict]]:
     """Evaluate all probes using in-memory activations."""
 
@@ -337,13 +348,15 @@ def _evaluate_probes_batch(
             else:
                 metric_name = str(metric_fn)
 
-            # Apply bootstrap wrapper if needed
-            bootstrapped_metric = with_bootstrap(
-                n_bootstrap=1000, confidence_level=0.95, random_state=42
-            )(metric_fn)
+            metric_callable = metric_fn
+            if (
+                bootstrap_kwargs is not None
+                and not getattr(metric_fn, "_probelib_bootstrap", False)
+            ):
+                metric_callable = with_bootstrap(**bootstrap_kwargs)(metric_fn)
 
-            # Compute metric with confidence intervals
-            result = bootstrapped_metric(y_true, y_pred)
+            # Compute metric (optionally bootstrapped)
+            result = metric_callable(y_true, y_pred)
             probe_metrics[metric_name] = result
 
         all_metrics[name] = probe_metrics
@@ -356,6 +369,7 @@ def _evaluate_probes_streaming(
     activation_iter: ActivationIterator,
     labels: torch.Tensor,
     metrics: list[Callable],
+    bootstrap_kwargs: dict[str, Any] | None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, MetricsDict]]:
     """Evaluate all probes in streaming mode."""
 
@@ -441,8 +455,14 @@ def _evaluate_probes_streaming(
             else:
                 metric_name = str(metric_fn)
 
-            # Compute metric with confidence intervals
-            result = metric_fn(y_true, y_pred)
+            metric_callable = metric_fn
+            if (
+                bootstrap_kwargs is not None
+                and not getattr(metric_fn, "_probelib_bootstrap", False)
+            ):
+                metric_callable = with_bootstrap(**bootstrap_kwargs)(metric_fn)
+
+            result = metric_callable(y_true, y_pred)
             probe_metrics[metric_name] = result
 
         all_metrics[name] = probe_metrics

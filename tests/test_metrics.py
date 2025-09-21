@@ -177,18 +177,24 @@ class TestBootstrap:
         assert ci_lower <= point_est <= ci_upper
 
     def test_bootstrap_with_existing_metrics(self):
-        """Test that existing metrics have bootstrap built-in."""
+        """Test that bootstrap can be opt-in for built-in metrics."""
         y_true = np.array([1, 1, 1, 0, 0, 0])
         y_pred = np.array([0.8, 0.9, 0.7, 0.2, 0.3, 0.1])
 
-        # auroc already has bootstrap decorator
+        # Default metrics now return raw floats
         result = auroc(y_true, y_pred)
+        assert isinstance(result, float)
+
+        # Opt-in bootstrap
+        bootstrapped_auroc = with_bootstrap(
+            n_bootstrap=100, confidence_level=0.95, random_state=42
+        )(auroc)
+        result = bootstrapped_auroc(y_true, y_pred)
         assert isinstance(result, tuple)
         assert len(result) == 3
 
         point_est, ci_lower, ci_upper = result
         assert 0.5 <= point_est <= 1.0
-        # With perfect separation, CIs might be NaN (all bootstrap samples identical)
         if not np.isnan(ci_lower) and not np.isnan(ci_upper):
             assert ci_lower <= point_est <= ci_upper
 
@@ -268,18 +274,15 @@ class TestFPRMetrics:
         y_true = np.array([0, 0, 0, 0, 0])  # All negative
         y_pred = np.array([0.1, 0.2, 0.3, 0.6, 0.8])
 
-        # Default threshold (0.5) - fpr has bootstrap decorator
+        # Default threshold (0.5)
         result = fpr(y_true, y_pred)
-        # Result is always a tuple with bootstrap
-        assert isinstance(result, tuple)
-        fpr_value = result[0]  # Extract point estimate
-        assert fpr_value == 0.4  # 2 out of 5 > 0.5
+        assert isinstance(result, float)
+        assert result == 0.4  # 2 out of 5 > 0.5
 
-        # Custom threshold - fpr_at_threshold also has bootstrap decorator
+        # Custom threshold
         result = fpr_at_threshold(y_true, y_pred, threshold=0.7)
-        assert isinstance(result, tuple)
-        fpr_value = result[0]  # Extract point estimate
-        assert fpr_value == 0.2  # 1 out of 5 > 0.7
+        assert isinstance(result, float)
+        assert result == 0.2  # 1 out of 5 > 0.7
 
     def test_fpr_with_mixed_dataset(self):
         """Test FPR with mixed positive/negative examples."""
