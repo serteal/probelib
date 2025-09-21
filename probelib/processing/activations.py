@@ -42,10 +42,8 @@ def get_batches(
     """Yield length-aware batches while preserving original indices.
 
     Sequences are sorted by non-padding length so each batch shares a similar
-    sequence length. This minimizes padding, keeps GPU transfers tight, and lets
-    us return tensor *views* (via ``narrow``) whenever the sorted indices are
-    contiguous. When a view is not possible we fall back to regular indexing and
-    copy only the necessary tokens.
+    sequence length. This minimizes padding, keeps GPU transfers tight, and
+    slices away excess padding for every field in ``inputs``.
 
     Args:
         inputs: Tokenized inputs keyed by field name.
@@ -54,63 +52,30 @@ def get_batches(
     """
     # Get sequence lengths and sort by length for efficient batching
     seq_lengths = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)  # type: ignore
-    sorted_indices = torch.sort(seq_lengths)[1].tolist()
+    sorted_indices = torch.sort(seq_lengths)[1]
 
     # Create batches
-    for start in range(0, len(sorted_indices), batch_size):
-        end = min(start + batch_size, len(sorted_indices))
-        batch_indices = sorted_indices[start:end]
-        batch_length = max(seq_lengths[idx] for idx in batch_indices)  # type: ignore
+    num_samples = sorted_indices.numel()
+    for start in range(0, num_samples, batch_size):
+        end = min(start + batch_size, num_samples)
+        batch_indices_tensor = sorted_indices[start:end]
+        batch_indices = batch_indices_tensor.tolist()
 
-        if end - start > 1:
-            # Use narrow() for tensor views (more memory efficient)
-            # Note: narrow requires contiguous indices, which sorted_indices provides
-            first_idx = min(batch_indices)
-            last_idx = max(batch_indices)
+        batch_lengths = seq_lengths.index_select(0, batch_indices_tensor)
+        batch_length = int(batch_lengths.max().item())
 
-            if (
-                first_idx == batch_indices[0]
-                and last_idx == batch_indices[-1]
-                and last_idx - first_idx + 1 == len(batch_indices)
-            ):
-                # Indices are contiguous, can use narrow
-                if tokenizer.padding_side == "right":
-                    batch_inputs = {
-                        k: v.narrow(0, first_idx, end - start).narrow(
-                            1, 0, batch_length
-                        )
-                        for k, v in inputs.items()
-                    }
-                else:
-                    seq_dim_size = inputs["input_ids"].shape[1]
-                    batch_inputs = {
-                        k: v.narrow(0, first_idx, end - start).narrow(
-                            1, seq_dim_size - batch_length, batch_length
-                        )
-                        for k, v in inputs.items()
-                    }
-            else:
-                # Fallback to regular indexing for non-contiguous indices
-                if tokenizer.padding_side == "right":
-                    batch_inputs = {
-                        k: v[batch_indices, :batch_length] for k, v in inputs.items()
-                    }
-                else:
-                    batch_inputs = {
-                        k: v[batch_indices, -batch_length:] for k, v in inputs.items()
-                    }
+        if tokenizer.padding_side == "right":
+            batch_inputs = {
+                key: tensor.index_select(0, batch_indices_tensor)[..., :batch_length]
+                for key, tensor in inputs.items()
+            }
+        elif tokenizer.padding_side == "left":
+            batch_inputs = {
+                key: tensor.index_select(0, batch_indices_tensor)[..., -batch_length:]
+                for key, tensor in inputs.items()
+            }
         else:
-            # Use regular slicing
-            if tokenizer.padding_side == "right":
-                batch_inputs = {
-                    k: v[batch_indices, :batch_length] for k, v in inputs.items()
-                }
-            elif tokenizer.padding_side == "left":
-                batch_inputs = {
-                    k: v[batch_indices, -batch_length:] for k, v in inputs.items()
-                }
-            else:
-                raise ValueError(f"Unknown padding side: {tokenizer.padding_side}")
+            raise ValueError(f"Unknown padding side: {tokenizer.padding_side}")
 
         yield batch_inputs, batch_indices
 

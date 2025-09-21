@@ -36,6 +36,31 @@ MetricsDict = Mapping[str, Any]
 MetricsOutput = Union[MetricsDict, Mapping[str, MetricsDict]]
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _metric_display_name(metric_fn: Callable) -> str:
+    """Create a consistent display name for metric functions/partials."""
+
+    if hasattr(metric_fn, "__name__") and metric_fn.__name__ not in {None, "<lambda>"}:
+        return metric_fn.__name__
+
+    if isinstance(metric_fn, functools.partial):
+        base = _metric_display_name(metric_fn.func)
+        arg_parts = [repr(arg) for arg in getattr(metric_fn, "args", ())]
+        kw_items = getattr(metric_fn, "keywords", {}) or {}
+        kw_parts = [f"{key}={value}" for key, value in kw_items.items()]
+        params = ", ".join(arg_parts + kw_parts)
+        return f"{base}({params})" if params else base
+
+    if hasattr(metric_fn, "__class__") and metric_fn.__class__.__name__ != "function":
+        return metric_fn.__class__.__name__
+
+    return repr(metric_fn)
+
+
 # TODO: rename to train_probes_parallel
 def train_probes(
     probes: BaseProbeInput,
@@ -334,20 +359,7 @@ def _evaluate_probes_batch(
         )
 
         for metric_fn in metrics:
-            # Get metric name
-            if hasattr(metric_fn, "__name__"):
-                metric_name = metric_fn.__name__
-            elif hasattr(metric_fn, "func"):  # functools.partial
-                # Create name from partial function
-                base_name = metric_fn.func.__name__
-                if metric_fn.keywords:
-                    params = "_".join(f"{k}={v}" for k, v in metric_fn.keywords.items())
-                    metric_name = f"{base_name}_{params}"
-                else:
-                    metric_name = base_name
-            else:
-                metric_name = str(metric_fn)
-
+            metric_name = _metric_display_name(metric_fn)
             metric_callable = metric_fn
             if (
                 bootstrap_kwargs is not None
@@ -434,27 +446,7 @@ def _evaluate_probes_streaming(
         )
 
         for metric_fn in metrics:
-            # Get metric name
-            if hasattr(metric_fn, "__name__"):
-                metric_name = metric_fn.__name__
-            elif hasattr(metric_fn, "func"):  # functools.partial
-                # Create name from partial function
-                base_name = metric_fn.func.__name__
-                if metric_fn.keywords:
-                    params_list = [f"{k}={v}" for k, v in metric_fn.keywords.items()]
-                    params = (
-                        ", ".join(params_list)
-                        if len(params_list) > 1
-                        else params_list[0]
-                        if params_list
-                        else ""
-                    )
-                    metric_name = f"{base_name} ({params})"
-                else:
-                    metric_name = base_name
-            else:
-                metric_name = str(metric_fn)
-
+            metric_name = _metric_display_name(metric_fn)
             metric_callable = metric_fn
             if (
                 bootstrap_kwargs is not None
