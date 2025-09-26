@@ -6,20 +6,20 @@ the most relevant parts for classification, instead of using fixed aggregation.
 """
 
 from pathlib import Path
-from typing import Self
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 
-from ..processing.activations import ActivationIterator, Activations
+from ..processing.activations import ActivationIterator, Activations, SequencePooling
 from .base import BaseProbe
 
 
-class AttentionNetwork(nn.Module):
+class _AttentionNetwork(nn.Module):
     """
-    Attention-based neural network for sequence classification.
+    Attention-based neural network for sequence classification (internal implementation).
 
     Architecture:
     - Attention scoring: MLP that outputs attention scores for each token
@@ -152,6 +152,7 @@ class Attention(BaseProbe):
     def __init__(
         self,
         layer: int,
+        sequence_pooling: SequencePooling = SequencePooling.NONE,
         hidden_dim: int = 128,  # Increased from 64
         dropout: float = 0.2,  # Added dropout parameter
         temperature: float = 2.0,  # Added temperature for calibration
@@ -167,10 +168,11 @@ class Attention(BaseProbe):
         Initialize attention probe.
 
         This probe handles sequences natively through learned attention weights,
-        so it doesn't require aggregation parameters.
+        so it requires sequence_pooling=NONE.
 
         Args:
             layer: Layer index to use activations from
+            sequence_pooling: Must be SequencePooling.NONE (attention requires sequences)
             hidden_dim: Hidden dimension for networks
             dropout: Dropout rate for regularization
             temperature: Temperature scaling for attention softmax
@@ -182,11 +184,16 @@ class Attention(BaseProbe):
             random_state: Random seed for reproducibility
             verbose: Whether to print progress information
         """
-        # Attention probe doesn't use aggregation - it learns to aggregate
+        # Attention probe requires sequences - cannot pool beforehand
+        if sequence_pooling != SequencePooling.NONE:
+            raise ValueError(
+                f"Attention probe requires sequence_pooling=NONE to compute attention weights, "
+                f"got {sequence_pooling.name}"
+            )
+
         super().__init__(
             layer=layer,
-            sequence_aggregation=None,  # No sequence aggregation
-            score_aggregation=None,  # No score aggregation - attention handles it
+            sequence_pooling=sequence_pooling,
             device=device,
             random_state=random_state,
             verbose=verbose,
@@ -214,15 +221,19 @@ class Attention(BaseProbe):
         if random_state is not None:
             torch.manual_seed(random_state)
 
-    def _init_network(self, d_model: int):
+    def _init_network(self, d_model: int, dtype: torch.dtype | None = None):
         """Initialize the network once we know the input dimension."""
         self._d_model = d_model
-        self._network = AttentionNetwork(
+        self._network = _AttentionNetwork(
             d_model=d_model,
             hidden_dim=self.hidden_dim,
             dropout=self.dropout,
             temperature=self.temperature,
         ).to(self.device)
+
+        # Match the dtype of the input features for mixed precision support
+        if dtype is not None:
+            self._network = self._network.to(dtype)
 
         self._optimizer = AdamW(
             self._network.parameters(),
@@ -251,7 +262,7 @@ class Attention(BaseProbe):
 
         # Filter to just the layer we need
         if len(X.layer_indices) > 1:
-            X = X.filter_layers([self.layer])
+            X = X.reduce(layer=self.layer)
 
         if X.n_layers != 1:
             raise ValueError(f"Expected single layer after filtering, got {X.n_layers}")
@@ -260,7 +271,7 @@ class Attention(BaseProbe):
         sequences = X.activations.squeeze(0)  # Remove layer dimension
         return sequences, X.detection_mask
 
-    def fit(self, X: Activations | ActivationIterator, y: list | torch.Tensor) -> Self:
+    def fit(self, X: Activations | ActivationIterator, y: list | torch.Tensor) -> "Attention":
         """
         Fit the probe on training data.
 
@@ -279,10 +290,12 @@ class Attention(BaseProbe):
         sequences, detection_mask = self._prepare_features(X)
         labels = self._prepare_labels(y)
 
-        # Move to device and ensure float32 for network compatibility
-        sequences = sequences.to(self.device).float()
+        # Move to device and ensure tensors are safe for autograd
+        sequences = sequences.to(self.device)
+        # Clone to avoid issues with inference tensors in autograd
+        sequences = sequences.clone()
         detection_mask = detection_mask.to(self.device)
-        labels = labels.to(self.device).float()
+        labels = labels.to(self.device).float()  # Labels should be float for BCE loss
 
         # Validate we have both classes
         unique_labels = torch.unique(labels)
@@ -293,7 +306,7 @@ class Attention(BaseProbe):
 
         # Initialize network if needed
         if self._network is None:
-            self._init_network(sequences.shape[-1])
+            self._init_network(sequences.shape[-1], dtype=sequences.dtype)
 
         # Create train/validation split
         n_samples = len(sequences)
@@ -356,7 +369,7 @@ class Attention(BaseProbe):
         self._fitted = True
         return self
 
-    def _fit_iterator(self, X: ActivationIterator, y: list | torch.Tensor) -> Self:
+    def _fit_iterator(self, X: ActivationIterator, y: list | torch.Tensor) -> "Attention":
         """
         Fit using an ActivationIterator (streaming mode).
 
@@ -379,7 +392,7 @@ class Attention(BaseProbe):
 
         return self
 
-    def partial_fit(self, X: Activations, y: list | torch.Tensor) -> Self:
+    def partial_fit(self, X: Activations, y: list | torch.Tensor) -> "Attention":
         """
         Incrementally fit the probe on a batch of samples.
 
@@ -393,14 +406,16 @@ class Attention(BaseProbe):
         sequences, detection_mask = self._prepare_features(X)
         labels = self._prepare_labels(y)
 
-        # Move to device and ensure float32 for network compatibility
-        sequences = sequences.to(self.device).float()
+        # Move to device and ensure tensors are safe for autograd
+        sequences = sequences.to(self.device)
+        # Clone to avoid issues with inference tensors in autograd
+        sequences = sequences.clone()
         detection_mask = detection_mask.to(self.device)
-        labels = labels.to(self.device).float()
+        labels = labels.to(self.device).float()  # Labels should be float for BCE loss
 
         # Initialize network on first batch
         if self._network is None:
-            self._init_network(sequences.shape[-1])
+            self._init_network(sequences.shape[-1], dtype=sequences.dtype)
 
         # Training step
         self._network.train()
@@ -436,7 +451,7 @@ class Attention(BaseProbe):
 
         # Get sequences and mask
         sequences, detection_mask = self._prepare_features(X)
-        sequences = sequences.to(self.device).float()  # Ensure float32 for network
+        sequences = sequences.to(self.device)
         detection_mask = detection_mask.to(self.device)
 
         # Get predictions
@@ -489,6 +504,7 @@ class Attention(BaseProbe):
         # Prepare state dict
         state = {
             "layer": self.layer,
+            "sequence_pooling": self.sequence_pooling.value,  # Always "none" for attention
             "hidden_dim": self.hidden_dim,
             "dropout": self.dropout,
             "temperature": self.temperature,
@@ -508,7 +524,7 @@ class Attention(BaseProbe):
         torch.save(state, path)
 
     @classmethod
-    def load(cls, path: Path | str, device: str | None = None) -> Self:
+    def load(cls, path: Path | str, device: str | None = None) -> "Attention":
         """
         Load a probe from disk.
 
@@ -523,8 +539,20 @@ class Attention(BaseProbe):
         state = torch.load(path, map_location="cpu")
 
         # Create probe instance
+        # sequence_pooling is always NONE for attention, but check if present for compatibility
+        sequence_pooling = SequencePooling.NONE  # Always NONE for attention
+        if "sequence_pooling" in state:
+            # Validate it's NONE if present
+            pooling_value = state["sequence_pooling"]
+            if pooling_value != "none":
+                raise ValueError(
+                    f"Loaded attention probe has invalid sequence_pooling={pooling_value}, "
+                    f"expected 'none'"
+                )
+
         probe = cls(
             layer=state["layer"],
+            sequence_pooling=sequence_pooling,
             hidden_dim=state["hidden_dim"],
             dropout=state.get("dropout", 0.2),  # Default for backwards compat
             temperature=state.get("temperature", 2.0),  # Default for backwards compat
@@ -551,6 +579,7 @@ class Attention(BaseProbe):
         probe._fitted = True
 
         return probe
+
 
     def __repr__(self) -> str:
         """String representation of the probe."""

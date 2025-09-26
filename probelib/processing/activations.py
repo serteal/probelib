@@ -5,11 +5,13 @@ This module provides tools for extracting activations from language models using
 with support for different model architectures and efficient memory management.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import (
     TYPE_CHECKING,
     Any,
     Generator,
+    Iterable,
     Iterator,
     Literal,
     Optional,
@@ -96,47 +98,379 @@ def get_hidden_dim(model: "PreTrainedModel") -> int:
         raise ValueError(f"Cannot determine hidden dimension for {model.name_or_path}")
 
 
-@dataclass
-class Activations:
-    """Activation tensor plus the metadata required to interpret it.
+class Axis(Enum):
+    LAYER = auto()
+    BATCH = auto()
+    SEQ = auto()
+    HIDDEN = auto()
 
-    Instances always keep tensors aligned: ``activations`` uses
-    ``layer_indices`` to record which model layers were captured, auxiliary
-    tensors (attention mask, detection mask, input ids) stay on the same device
-    as the activations, and optional ``batch_indices`` tells streaming callers
-    which original examples a batch corresponds to. Helper methods such as
-    ``filter_layers`` and ``aggregate`` rely on these invariants and preserve
-    metadata, so downstream probes can focus on modelling instead of plumbing.
+
+class SequencePooling(Enum):
+    """Pooling methods for reducing sequence dimension in probes.
+
+    NONE: No pooling - use token-level features for training
+    MEAN: Average pooling over detected tokens
+    MAX: Max pooling over detected tokens
+    LAST_TOKEN: Use the last detected token
     """
 
-    activations: Float[torch.Tensor, "n_layers batch_size seq_len d_model"]
-    attention_mask: Float[torch.Tensor, "batch_size seq_len"]
-    input_ids: Float[torch.Tensor, "batch_size seq_len"]
-    detection_mask: Float[torch.Tensor, "batch_size seq_len"]
-    layer_indices: list[
-        int
-    ]  # Maps layer dimension in `activations` to original model layer indices
-    batch_indices: list[int] | None = None  # Original indices of samples in this batch
+    NONE = "none"
+    MEAN = "mean"
+    MAX = "max"
+    LAST_TOKEN = "last_token"
+
+
+@dataclass(slots=True)
+class LayerMeta:
+    indices: tuple[int, ...]
+
+
+@dataclass(slots=True)
+class SequenceMeta:
+    attention_mask: torch.Tensor
+    detection_mask: torch.Tensor
+    input_ids: torch.Tensor
+
+
+_DEFAULT_AXES: tuple[Axis, ...] = (
+    Axis.LAYER,
+    Axis.BATCH,
+    Axis.SEQ,
+    Axis.HIDDEN,
+)
+
+
+def _ensure_canonical_axes(axes: tuple[Axis, ...]) -> tuple[Axis, ...]:
+    allowed = tuple(axis for axis in _DEFAULT_AXES if axis in axes)
+    if allowed != axes:
+        raise ValueError(
+            "axes must be an ordered subset of (Axis.LAYER, Axis.BATCH, Axis.SEQ, Axis.HIDDEN)"
+        )
+    return axes
+
+
+@dataclass(slots=True)
+class Activations:
+    """Axis-aware container for activation tensors and metadata."""
+
+    activations: Float[torch.Tensor, "..."]
+    axes: tuple[Axis, ...] = _DEFAULT_AXES
+    layer_meta: LayerMeta | None = None
+    sequence_meta: SequenceMeta | None = None
+    batch_indices: torch.Tensor | None = None
+
+    _axis_positions: dict[Axis, int] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self.axes = _ensure_canonical_axes(self.axes)
+
+        if self.activations.ndim != len(self.axes):
+            raise ValueError("Activation tensor rank and axes metadata disagree")
+
+        if not self.activations.is_floating_point():
+            self.activations = self.activations.float()
+
+        self._axis_positions = {axis: idx for idx, axis in enumerate(self.axes)}
+
+        self._validate_layer_meta()
+        self._validate_sequence_meta()
+        self._validate_batch_indices()
+
+    # ------------------------------------------------------------------
+    # Basic properties
+    # ------------------------------------------------------------------
+    @property
+    def shape(self) -> torch.Size:
+        return self.activations.shape
 
     @property
-    def shape(self) -> tuple[int, int, int]:
-        return self.activations.shape  # type: ignore
+    def axis_positions(self) -> dict[Axis, int]:
+        return dict(self._axis_positions)
+
+    def has_axis(self, axis: Axis) -> bool:
+        return axis in self._axis_positions
+
+    def axis_size(self, axis: Axis) -> int:
+        try:
+            dim = self._axis_positions[axis]
+        except KeyError as exc:
+            raise AttributeError(f"Axis {axis.name} has been removed") from exc
+        return self.activations.shape[dim]
 
     @property
     def n_layers(self) -> int:
-        return self.activations.shape[0]
+        return self.axis_size(Axis.LAYER)
 
     @property
     def batch_size(self) -> int:
-        return self.activations.shape[1]
+        return self.axis_size(Axis.BATCH)
 
     @property
     def seq_len(self) -> int:
-        return self.activations.shape[2]
+        return self.axis_size(Axis.SEQ)
 
     @property
     def d_model(self) -> int:
-        return self.activations.shape[3]
+        return self.axis_size(Axis.HIDDEN)
+
+    @property
+    def attention_mask(self) -> torch.Tensor | None:
+        return None if self.sequence_meta is None else self.sequence_meta.attention_mask
+
+    @property
+    def detection_mask(self) -> torch.Tensor | None:
+        return None if self.sequence_meta is None else self.sequence_meta.detection_mask
+
+    @property
+    def input_ids(self) -> torch.Tensor | None:
+        return None if self.sequence_meta is None else self.sequence_meta.input_ids
+
+    @property
+    def layer_indices(self) -> list[int]:
+        return [] if self.layer_meta is None else list(self.layer_meta.indices)
+
+    @property
+    def has_sequences(self) -> bool:
+        """Check if sequence dimension exists."""
+        return Axis.SEQ in self._axis_positions
+
+    @property
+    def has_layers(self) -> bool:
+        """Check if layer dimension exists."""
+        return Axis.LAYER in self._axis_positions
+
+    @classmethod
+    def from_tensor(
+        cls,
+        activations: torch.Tensor,
+        *,
+        layer_indices: list[int] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        detection_mask: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
+    ) -> "Activations":
+        """Create Activations from a tensor with sensible defaults.
+
+        This is a convenience method for simple cases. It automatically:
+        - Detects axes from tensor shape
+        - Creates default masks if not provided
+        - Handles layer metadata
+
+        Args:
+            activations: Activation tensor with shape:
+                - [batch, seq, hidden] for single layer
+                - [layer, batch, seq, hidden] for multiple layers
+            layer_indices: Which layers these activations come from.
+                          Defaults to [0] for single layer or range for multiple.
+            attention_mask: Optional attention mask [batch, seq].
+                           Defaults to all 1s.
+            detection_mask: Optional detection mask [batch, seq].
+                           Defaults to all 1s.
+            input_ids: Optional input token IDs [batch, seq].
+                      Defaults to all 1s.
+            batch_indices: Optional batch indices for streaming.
+
+        Returns:
+            Activations object ready to use.
+
+        Examples:
+            # Simple case - single layer
+            acts = torch.randn(4, 10, 768)  # [batch, seq, hidden]
+            activations = Activations.from_tensor(acts)
+
+            # With custom masks
+            acts = torch.randn(4, 10, 768)
+            mask = torch.ones(4, 10)
+            mask[:, 5:] = 0  # Mask out later tokens
+            activations = Activations.from_tensor(
+                acts,
+                attention_mask=mask,
+                detection_mask=mask
+            )
+
+            # Multiple layers
+            acts = torch.randn(12, 4, 10, 768)  # [layer, batch, seq, hidden]
+            activations = Activations.from_tensor(acts, layer_indices=list(range(12)))
+        """
+        # Determine shape and axes
+        if activations.ndim == 3:
+            # [batch, seq, hidden] - single layer
+            batch_size, seq_len, hidden_size = activations.shape
+            axes = (Axis.BATCH, Axis.SEQ, Axis.HIDDEN)
+
+            # Add layer dimension
+            activations = activations.unsqueeze(0)  # [1, batch, seq, hidden]
+            axes = (Axis.LAYER, Axis.BATCH, Axis.SEQ, Axis.HIDDEN)
+
+            if layer_indices is None:
+                layer_indices = [0]
+
+        elif activations.ndim == 4:
+            # [layer, batch, seq, hidden] - multiple layers
+            n_layers, batch_size, seq_len, hidden_size = activations.shape
+            axes = (Axis.LAYER, Axis.BATCH, Axis.SEQ, Axis.HIDDEN)
+
+            if layer_indices is None:
+                layer_indices = list(range(n_layers))
+        else:
+            raise ValueError(
+                f"Expected 3D [batch, seq, hidden] or 4D [layer, batch, seq, hidden] tensor, "
+                f"got shape {activations.shape}"
+            )
+
+        # Create default masks if needed
+        if attention_mask is None:
+            attention_mask = torch.ones(batch_size, seq_len, dtype=torch.float32)
+
+        if detection_mask is None:
+            detection_mask = torch.ones(batch_size, seq_len, dtype=torch.float32)
+
+        if input_ids is None:
+            input_ids = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+        # Move to same device as activations
+        device = activations.device
+        attention_mask = attention_mask.to(device)
+        detection_mask = detection_mask.to(device)
+        input_ids = input_ids.to(device)
+
+        # Create metadata
+        layer_meta = LayerMeta(indices=tuple(layer_indices))
+        sequence_meta = SequenceMeta(
+            attention_mask=attention_mask,
+            detection_mask=detection_mask,
+            input_ids=input_ids,
+        )
+
+        return cls(
+            activations=activations,
+            axes=axes,
+            layer_meta=layer_meta,
+            sequence_meta=sequence_meta,
+            batch_indices=batch_indices,
+        )
+
+    @classmethod
+    def from_components(
+        cls,
+        *,
+        activations: torch.Tensor,
+        layer_indices: Iterable[int],
+        attention_mask: torch.Tensor,
+        detection_mask: torch.Tensor,
+        input_ids: torch.Tensor,
+        batch_indices: Iterable[int] | torch.Tensor | None = None,
+        axes: tuple[Axis, ...] = _DEFAULT_AXES,
+    ) -> "Activations":
+        layer_meta = LayerMeta(tuple(int(i) for i in layer_indices))
+        sequence_meta = SequenceMeta(
+            attention_mask=attention_mask,
+            detection_mask=detection_mask,
+            input_ids=input_ids,
+        )
+        batch_tensor = (
+            torch.as_tensor(batch_indices, dtype=torch.long)
+            if batch_indices is not None
+            else None
+        )
+        return cls(
+            activations=activations,
+            axes=axes,
+            layer_meta=layer_meta,
+            sequence_meta=sequence_meta,
+            batch_indices=batch_tensor,
+        )
+
+    # ------------------------------------------------------------------
+    # Validation helpers
+    # ------------------------------------------------------------------
+    def _validate_layer_meta(self) -> None:
+        has_layer_axis = Axis.LAYER in self._axis_positions
+        if has_layer_axis:
+            if self.layer_meta is None:
+                raise ValueError(
+                    "layer_meta is required when the layer axis is present"
+                )
+            indices = tuple(int(i) for i in self.layer_meta.indices)
+            if len(indices) != self.axis_size(Axis.LAYER):
+                raise ValueError("layer_meta length must match layer dimension")
+            self.layer_meta = LayerMeta(indices)
+        elif self.layer_meta is not None:
+            raise ValueError("layer_meta must be None after reducing the layer axis")
+
+    def _validate_sequence_meta(self) -> None:
+        has_seq_axis = Axis.SEQ in self._axis_positions
+        if has_seq_axis:
+            if self.sequence_meta is None:
+                raise ValueError(
+                    "sequence_meta is required while the sequence axis is present"
+                )
+            batch = self.axis_size(Axis.BATCH)
+            seq = self.axis_size(Axis.SEQ)
+
+            attn = self.sequence_meta.attention_mask.to(self.activations.device)
+            detect = self.sequence_meta.detection_mask.to(self.activations.device)
+            ids = self.sequence_meta.input_ids.to(self.activations.device)
+
+            expected = (batch, seq)
+            for name, tensor in (
+                ("attention_mask", attn),
+                ("detection_mask", detect),
+                ("input_ids", ids),
+            ):
+                if tensor.shape != expected:
+                    raise ValueError(f"{name} shape {tensor.shape} expected {expected}")
+
+            allowed_detect_dtypes = {
+                torch.float16,
+                torch.float32,
+                torch.float64,
+                torch.bfloat16,
+                torch.bool,
+                torch.int32,
+                torch.int64,
+            }
+            if detect.dtype not in allowed_detect_dtypes:
+                raise ValueError("detection_mask must be float, bool, or int tensor")
+
+            if ids.dtype not in (torch.int32, torch.int64):
+                raise ValueError("input_ids must be an integer tensor")
+
+            self.sequence_meta = SequenceMeta(
+                attention_mask=attn,
+                detection_mask=detect,
+                input_ids=ids,
+            )
+        elif self.sequence_meta is not None:
+            raise ValueError(
+                "sequence_meta must be None after reducing the sequence axis"
+            )
+
+    def _validate_batch_indices(self) -> None:
+        if self.batch_indices is None:
+            return
+
+        tensor = torch.as_tensor(self.batch_indices, dtype=torch.long)
+        if tensor.ndim != 1:
+            raise ValueError("batch_indices must be one-dimensional")
+
+        if Axis.BATCH not in self._axis_positions:
+            raise ValueError("batch_indices provided but batch axis is absent")
+
+        if tensor.numel() != self.axis_size(Axis.BATCH):
+            raise ValueError("batch_indices length must match batch dimension")
+
+        self.batch_indices = tensor
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+    def expect_axes(self, *axes: Axis) -> None:
+        missing = tuple(axis for axis in axes if axis not in self._axis_positions)
+        if missing:
+            names = ", ".join(axis.name for axis in missing)
+            raise ValueError(f"Expected axes {names} to be present; got {self.axes}")
 
     def get_layer_tensor_indices(self, requested_layers: int | list[int]) -> list[int]:
         """
@@ -154,210 +488,290 @@ class Activations:
         if isinstance(requested_layers, int):
             requested_layers = [requested_layers]
 
-        tensor_indices = []
+        self.expect_axes(Axis.LAYER)
+        layer_indices = self._require_layer_meta().indices
+
+        tensor_indices: list[int] = []
         for layer in requested_layers:
             try:
-                tensor_idx = self.layer_indices.index(layer)
-                tensor_indices.append(tensor_idx)
-            except ValueError:
-                available_layers = ", ".join(map(str, self.layer_indices))
+                tensor_indices.append(layer_indices.index(layer))
+            except ValueError as exc:
+                available_layers = ", ".join(map(str, layer_indices))
                 raise ValueError(
-                    f"Requested layer {layer} is not available. "
-                    f"Available layers: [{available_layers}]"
-                )
+                    f"Layer {layer} unavailable. Present layers: [{available_layers}]"
+                ) from exc
         return tensor_indices
 
-    def __post_init__(self):
-        """Validate shapes and apply attention mask."""
-        shape = (self.batch_size, self.seq_len)
-        assert self.attention_mask.shape == shape, (
-            f"Attention mask shape {self.attention_mask.shape} doesn't match {shape}"
-        )
-        assert self.input_ids.shape == shape, (
-            f"Input IDs shape {self.input_ids.shape} doesn't match {shape}"
-        )
+    def _require_layer_meta(self) -> LayerMeta:
+        if self.layer_meta is None:
+            raise ValueError("Layer metadata is unavailable; layer axis was reduced")
+        return self.layer_meta
 
-        device = self.activations.device
-        self.attention_mask = self.attention_mask.to(device)
-        self.input_ids = self.input_ids.to(device)
-        self.detection_mask = self.detection_mask.to(device)
-
-        # Ensure activations are floating point (but preserve the specific dtype if already float)
-        if not self.activations.is_floating_point():
-            self.activations = self.activations.float()
+    def _require_sequence_meta(self) -> SequenceMeta:
+        if self.sequence_meta is None:
+            raise ValueError(
+                "Sequence metadata is unavailable; sequence axis was reduced"
+            )
+        return self.sequence_meta
 
     def to(self, *args, **kwargs) -> "Activations":
-        """Move activation to device/dtype.
+        converted = self.activations.to(*args, **kwargs)
 
-        Supports same arguments as torch.Tensor.to():
-        - device only: .to(device)
-        - dtype only: .to(dtype)
-        - both: .to(device, dtype) or .to(dtype=dtype, device=device)
-        """
-        # Copy layer indices since they don't need device/dtype conversion
-        layer_indices = self.layer_indices.copy()
-
-        # Convert activations using same args
-        converted_activations = self.activations.to(*args, **kwargs)
-
-        # For device changes, also move other tensors
-        if (
-            any(isinstance(arg, (str, torch.device)) for arg in args)
-            or "device" in kwargs
-        ):
-            # Extract just the device argument
-            if "device" in kwargs:
-                device = kwargs["device"]
-            else:
-                device = next(
-                    arg for arg in args if isinstance(arg, (str, torch.device))
-                )
-
-            return Activations(
-                activations=converted_activations,
-                attention_mask=self.attention_mask.to(device),
-                input_ids=self.input_ids.to(device),
-                detection_mask=self.detection_mask.to(device),
-                layer_indices=layer_indices,
-                batch_indices=self.batch_indices.copy()
-                if self.batch_indices is not None
-                else None,
-            )
-
-        # For dtype only changes, only convert activations
-        return Activations(
-            activations=converted_activations,
-            attention_mask=self.attention_mask,
-            input_ids=self.input_ids,
-            detection_mask=self.detection_mask,
-            layer_indices=layer_indices,
-            batch_indices=self.batch_indices,
-        )
-
-    def filter_layers(self, target_layers: int | list[int]) -> "Activations":
-        """
-        Filter activations to only include specified layers.
-
-        Args:
-            target_layers: List of layer indices to keep
-
-        Returns:
-            New Activations object with filtered layers
-        """
-        if isinstance(target_layers, int):
-            target_layers = [target_layers]
-
-        # Get tensor indices for target layers
-        tensor_indices = self.get_layer_tensor_indices(target_layers)
-
-        # Filter activations tensor
-        filtered_activations = self.activations[tensor_indices]
-
-        return Activations(
-            activations=filtered_activations,
-            input_ids=self.input_ids,
-            attention_mask=self.attention_mask,
-            detection_mask=self.detection_mask,
-            layer_indices=target_layers,
-            batch_indices=self.batch_indices,
-        )
-
-    def aggregate(
-        self, method: Literal["mean", "max", "last_token"] = "mean"
-    ) -> torch.Tensor:
-        """
-        Aggregate activations over sequence dimension for single layer.
-
-        Args:
-            method: Aggregation method
-                - 'mean': Average over detected tokens
-                - 'max': Maximum over detected tokens
-                - 'last_token': Use the last detected token
-
-        Returns:
-            Tensor with shape [n_samples, d_model]
-
-        Raises:
-            ValueError: If not single layer
-        """
-        if self.n_layers != 1:
-            raise ValueError(
-                f"Aggregation requires single layer, got {self.n_layers} layers. "
-                f"Use filter_layers([layer_idx]) first."
-            )
-
-        acts = self.activations[0]  # [n_samples, seq_len, d_model]
-        mask = self.detection_mask  # [n_samples, seq_len]
-
-        # Apply detection mask
-        mask_expanded = mask.unsqueeze(-1)  # [n_samples, seq_len, 1]
-        masked_acts = acts * mask_expanded
-
-        # Aggregate over sequence
-        if method == "mean":
-            counts = mask.sum(dim=1, keepdim=True).clamp(min=1)  # [n_samples, 1]
-            aggregated = masked_acts.sum(dim=1) / counts
-        elif method == "max":
-            # Replace masked positions with -inf for max
-            masked_acts = acts.clone()
-            masked_acts[~mask.bool()] = float("-inf")
-            aggregated = masked_acts.max(dim=1).values
-
-            # Handle batches with no valid tokens (replace -inf with 0)
-            no_valid = ~mask.bool().any(dim=1)  # [n_samples]
-            aggregated[no_valid] = 0.0
-        elif method == "last_token":
-            # Get last valid token per sequence
-            last_indices = mask.sum(dim=1) - 1  # [n_samples]
-
-            # Handle batches with no valid tokens
-            no_valid = ~mask.bool().any(dim=1)
-            last_indices = last_indices.clamp(min=0)  # Avoid negative indices
-
-            batch_indices = torch.arange(self.batch_size, device=acts.device)
-            aggregated = acts[batch_indices, last_indices.long()]
-
-            # Zero out batches with no valid tokens
-            aggregated[no_valid] = 0.0
+        target_device: torch.device | None = None
+        if "device" in kwargs:
+            target_device = torch.device(kwargs["device"])
         else:
-            raise ValueError(f"Unknown aggregation method: {method}")
+            for arg in args:
+                if isinstance(arg, torch.device):
+                    target_device = arg
+                    break
+                if isinstance(arg, str):
+                    target_device = torch.device(arg)
+                    break
 
-        return aggregated
-
-    def to_token_level(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Extract token-level features for token-level training.
-
-        Returns:
-            (features, tokens_per_sample) where:
-            - features: [n_total_tokens, d_model] containing only detected tokens
-            - tokens_per_sample: [n_samples] with count of tokens per sample for label expansion
-
-        Raises:
-            ValueError: If not single layer
-        """
-        if self.n_layers != 1:
-            raise ValueError(
-                f"Token extraction requires single layer, got {self.n_layers} layers. "
-                f"Use filter_layers([layer_idx]) first."
+        sequence_meta = self.sequence_meta
+        if target_device is not None and sequence_meta is not None:
+            sequence_meta = SequenceMeta(
+                attention_mask=sequence_meta.attention_mask.to(target_device),
+                detection_mask=sequence_meta.detection_mask.to(target_device),
+                input_ids=sequence_meta.input_ids.to(target_device),
             )
 
-        acts = self.activations[0]  # [n_samples, seq_len, d_model]
-        mask = self.detection_mask.bool()  # [n_samples, seq_len]
+        return Activations(
+            activations=converted,
+            axes=self.axes,
+            layer_meta=self.layer_meta,
+            sequence_meta=sequence_meta,
+            batch_indices=self.batch_indices,
+        )
 
-        # Vectorized token extraction – flatten mask and gather in a single op
+    # ------------------------------------------------------------------
+    # Axis transforms
+    # ------------------------------------------------------------------
+
+    def select_layer(self, layer: int) -> "Activations":
+        """
+        Select a single layer, removing the LAYER axis.
+
+        Args:
+            layer: Layer index to select
+
+        Returns:
+            New Activations without LAYER axis
+        """
+        self.expect_axes(Axis.LAYER)
+        tensor_idx = self.get_layer_tensor_indices([layer])[0]
+        dim = self._axis_positions[Axis.LAYER]
+        selected = self.activations.select(dim, tensor_idx)
+
+        new_axes = tuple(ax for ax in self.axes if ax != Axis.LAYER)
+        return Activations(
+            activations=selected,
+            axes=new_axes,
+            layer_meta=None,
+            sequence_meta=self.sequence_meta,
+            batch_indices=self.batch_indices,
+        )
+
+    def select_layers(self, layers: list[int]) -> "Activations":
+        """
+        Select multiple layers, keeping the LAYER axis.
+
+        Args:
+            layers: List of layer indices to select
+
+        Returns:
+            New Activations with selected layers
+        """
+        self.expect_axes(Axis.LAYER)
+        if not layers:
+            raise ValueError("layers must be non-empty")
+
+        tensor_indices = self.get_layer_tensor_indices(layers)
+        dim = self._axis_positions[Axis.LAYER]
+        index = torch.as_tensor(
+            tensor_indices, device=self.activations.device, dtype=torch.long
+        )
+        subset = torch.index_select(self.activations, dim=dim, index=index)
+
+        new_meta = LayerMeta(tuple(layers))
+        return Activations(
+            activations=subset,
+            axes=self.axes,
+            layer_meta=new_meta,
+            sequence_meta=self.sequence_meta,
+            batch_indices=self.batch_indices,
+        )
+
+    def sequence_pool(
+        self,
+        method: Literal["mean", "max", "last_token"] = "mean",
+        use_detection_mask: bool = True,
+    ) -> "Activations":
+        """
+        Pool over the sequence dimension, removing SEQ axis.
+
+        Args:
+            method: Pooling method to use
+            use_detection_mask: If True, only pool over detected tokens (default)
+                               If False, pool over all tokens
+
+        Returns:
+            New Activations without SEQ axis
+        """
+        self.expect_axes(Axis.SEQ)
+
+        if use_detection_mask:
+            # Use existing _reduce_sequence which respects detection mask
+            reduced = self._reduce_sequence(method)
+        else:
+            # Simple pooling over all tokens
+            dim = self._axis_positions[Axis.SEQ]
+            if method == "mean":
+                reduced = self.activations.mean(dim=dim)
+            elif method == "max":
+                reduced = self.activations.max(dim=dim).values
+            elif method == "last_token":
+                # Take the last token (index -1) for each sequence
+                reduced = self.activations.select(dim, -1)
+            else:
+                raise ValueError(f"Unknown pooling method: {method}")
+
+        new_axes = tuple(ax for ax in self.axes if ax != Axis.SEQ)
+        return Activations(
+            activations=reduced,
+            axes=new_axes,
+            layer_meta=self.layer_meta,
+            sequence_meta=None,
+            batch_indices=self.batch_indices,
+        )
+
+    def extract_tokens(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract detected tokens for token-level training.
+
+        Returns:
+            Tuple of (features, tokens_per_sample) where:
+            - features: [n_tokens, hidden] tensor of detected tokens
+            - tokens_per_sample: [batch] tensor of token counts per sample
+        """
+        self.expect_axes(Axis.BATCH, Axis.SEQ, Axis.HIDDEN)
+
+        if self.has_axis(Axis.LAYER):
+            if self.n_layers != 1:
+                raise ValueError(
+                    "Token extraction requires single layer. Use select_layer() first."
+                )
+            # Remove layer dimension
+            acts = self.activations.squeeze(self._axis_positions[Axis.LAYER])
+        else:
+            acts = self.activations
+
+        seq_meta = self._require_sequence_meta()
+        mask = seq_meta.detection_mask.bool()
         tokens_per_sample = mask.sum(dim=1)
 
         if tokens_per_sample.sum() == 0:
             features = torch.empty(
-                0, self.d_model, device=acts.device, dtype=acts.dtype
+                0,
+                acts.shape[-1],
+                device=acts.device,
+                dtype=acts.dtype,
             )
         else:
-            features = acts[mask]  # [n_total_tokens, d_model]
+            features = acts[mask]
 
-        tokens_per_sample = tokens_per_sample.to(device=acts.device)
+        return features, tokens_per_sample.to(device=acts.device)
 
-        return features, tokens_per_sample
+    # ------------------------------------------------------------------
+    # Internal sequence reduction
+    # ------------------------------------------------------------------
+    def _reduce_sequence(
+        self, method: Literal["mean", "max", "last_token"]
+    ) -> torch.Tensor:
+        if method not in {"mean", "max", "last_token"}:
+            raise ValueError(f"Unknown sequence reduction method: {method}")
+
+        seq_meta = self._require_sequence_meta()
+        detection = seq_meta.detection_mask
+        mask_bool = detection.bool()
+        mask_float = mask_bool.to(dtype=self.activations.dtype)
+
+        batch_dim = self._axis_positions[Axis.BATCH]
+        seq_dim = self._axis_positions[Axis.SEQ]
+        rank = self.activations.ndim
+
+        other_dims = [idx for idx in range(rank) if idx not in (batch_dim, seq_dim)]
+        permute = [batch_dim, seq_dim] + other_dims
+        acts = self.activations.permute(permute)
+
+        mask_view = mask_float.view(
+            mask_float.shape[0],
+            mask_float.shape[1],
+            *([1] * (acts.ndim - 2)),
+        )
+
+        if method == "mean":
+            masked = acts * mask_view
+            counts = mask_view.sum(dim=1).clamp_min(1.0)
+            reduced = masked.sum(dim=1) / counts
+        elif method == "max":
+            mask_bool_view = mask_bool.view(
+                mask_bool.shape[0],
+                mask_bool.shape[1],
+                *([1] * (acts.ndim - 2)),
+            )
+            masked = acts.masked_fill(~mask_bool_view, float("-inf"))
+            reduced = masked.max(dim=1).values
+
+            no_valid = ~mask_bool.any(dim=1)
+            if no_valid.any():
+                reduced = reduced.clone()
+                no_valid_view = no_valid.view(
+                    no_valid.shape[0],
+                    *([1] * (reduced.ndim - 1)),
+                ).expand_as(reduced)
+                reduced.masked_fill_(no_valid_view, 0.0)
+        else:
+            valid_counts = mask_bool.sum(dim=1)
+            no_valid = valid_counts == 0
+            last_indices = torch.clamp(valid_counts - 1, min=0).to(dtype=torch.long)
+
+            gather_index = last_indices.view(
+                mask_bool.shape[0],
+                1,
+                *([1] * (acts.ndim - 2)),
+            ).expand(mask_bool.shape[0], 1, *acts.shape[2:])
+
+            reduced = torch.take_along_dim(acts, gather_index, dim=1).squeeze(1)
+            if no_valid.any():
+                reduced = reduced.clone()
+                no_valid_view = no_valid.view(
+                    no_valid.shape[0],
+                    *([1] * (reduced.ndim - 1)),
+                ).expand_as(reduced)
+                reduced.masked_fill_(no_valid_view, 0.0)
+
+        remaining_axes = tuple(axis for axis in self.axes if axis not in (Axis.SEQ,))
+        permuted_axes = (Axis.BATCH,) + tuple(
+            axis for axis in self.axes if axis not in (Axis.BATCH, Axis.SEQ)
+        )
+
+        permute_back = [permuted_axes.index(axis) for axis in remaining_axes]
+        if permute_back != list(range(len(remaining_axes))):
+            reduced = reduced.permute(permute_back)
+
+        return reduced
+
+
+def _coerce_axis(value: Axis | Literal["layer", "sequence"]) -> Axis:
+    if isinstance(value, Axis):
+        return value
+    mapping = {"layer": Axis.LAYER, "sequence": Axis.SEQ}
+    try:
+        return mapping[value]
+    except KeyError as exc:
+        raise ValueError(f"Unknown axis specifier {value!r}") from exc
 
 
 def streaming_activations(
@@ -413,11 +827,14 @@ def streaming_activations(
                 }
             yield Activations(
                 activations=hooked_model.get_activations(batch_inputs),
-                attention_mask=batch_inputs["attention_mask"],
-                input_ids=batch_inputs["input_ids"],
-                detection_mask=batch_inputs["detection_mask"],
-                layer_indices=layers,
-                batch_indices=batch_indices,
+                axes=_DEFAULT_AXES,
+                layer_meta=LayerMeta(tuple(layers)),
+                sequence_meta=SequenceMeta(
+                    attention_mask=batch_inputs["attention_mask"],
+                    detection_mask=batch_inputs["detection_mask"],
+                    input_ids=batch_inputs["input_ids"],
+                ),
+                batch_indices=torch.as_tensor(batch_indices, dtype=torch.long),
             )
 
 
@@ -531,10 +948,14 @@ def batch_activations(
 
     return Activations(
         activations=all_activations,
-        attention_mask=tokenized_inputs["attention_mask"],
-        input_ids=tokenized_inputs["input_ids"],
-        detection_mask=tokenized_inputs["detection_mask"],
-        layer_indices=layers,
+        axes=_DEFAULT_AXES,
+        layer_meta=LayerMeta(tuple(layers)),
+        sequence_meta=SequenceMeta(
+            attention_mask=tokenized_inputs["attention_mask"],
+            detection_mask=tokenized_inputs["detection_mask"],
+            input_ids=tokenized_inputs["input_ids"],
+        ),
+        batch_indices=torch.arange(n_samples, dtype=torch.long),
     )
 
 

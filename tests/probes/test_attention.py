@@ -83,9 +83,9 @@ class TestAttention:
         assert probe.patience == 5
         assert probe._fitted is False
         assert probe._requires_grad is True
-        # Attention probe ignores aggregation settings
-        assert probe.sequence_aggregation is None
-        assert probe.score_aggregation is None
+        # Attention probe requires sequence_pooling=NONE
+        from probelib.processing import SequencePooling
+        assert probe.sequence_pooling == SequencePooling.NONE
 
     def test_fit(self):
         """Test fitting the attention probe."""
@@ -213,8 +213,8 @@ class TestAttention:
         )
 
         # Internally should always use token-level
-        assert probe.sequence_aggregation is None
-        assert probe.score_aggregation is None
+        from probelib.processing import SequencePooling
+        assert probe.sequence_pooling == SequencePooling.NONE
 
         # Should still work normally
         probe.fit(activations, labels)

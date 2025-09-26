@@ -155,65 +155,58 @@ def benchmark_probe_training(
 
         return inner_train_probe_full
 
-    # logistic_full_pipeline_result = measure_with_warmup(
-    #     train_probe_full(pl.probes.SklearnLogistic, sequence_aggregation="mean"),  # type: ignore
-    #     warmup_runs=1,
-    #     measurement_runs=3,
-    #     name="Logistic Full Pipeline",
-    # )
-    # results["logistic_sequence_full_pipeline"] = logistic_full_pipeline_result
-    # logistic_score_full_pipeline_result = measure_with_warmup(
-    #     train_probe_full(pl.probes.SklearnLogistic, score_aggregation="mean"),  # type: ignore
-    #     warmup_runs=1,
-    #     measurement_runs=3,
-    #     name="Logistic Score Full Pipeline",
-    # )
-    # results["logistic_score_full_pipeline"] = logistic_score_full_pipeline_result
+    # Import SequencePooling for the new API
+    from probelib.processing import SequencePooling
 
-    gpu_logistic_full_pipeline_result = measure_with_warmup(
-        train_probe_full(pl.probes.Logistic, sequence_aggregation="mean"),  # type: ignore
+    # Test with MEAN pooling (sample-level aggregation)
+    gpu_logistic_mean_result = measure_with_warmup(
+        train_probe_full(pl.probes.Logistic, sequence_pooling=SequencePooling.MEAN),  # type: ignore
         warmup_runs=1,
         measurement_runs=3,
-        name="GPU Logistic Full Pipeline",
+        name="GPU Logistic with MEAN pooling",
     )
-    results["gpu_logistic_full_pipeline"] = gpu_logistic_full_pipeline_result
-    gpu_logistic_score_full_pipeline_result = measure_with_warmup(
-        train_probe_full(pl.probes.Logistic, score_aggregation="mean"),  # type: ignore
-        warmup_runs=1,
-        measurement_runs=3,
-        name="GPU Logistic Score Full Pipeline",
-    )
-    results["gpu_logistic_score_full_pipeline"] = (
-        gpu_logistic_score_full_pipeline_result
-    )
+    results["gpu_logistic_mean_pooling"] = gpu_logistic_mean_result
 
-    mlp_full_pipeline_result = measure_with_warmup(
-        train_probe_full(pl.probes.MLP, sequence_aggregation="mean"),  # type: ignore
+    # Test with NONE pooling (token-level training)
+    gpu_logistic_token_result = measure_with_warmup(
+        train_probe_full(pl.probes.Logistic, sequence_pooling=SequencePooling.NONE),  # type: ignore
         warmup_runs=1,
         measurement_runs=3,
-        name="MLP Full Pipeline",
+        name="GPU Logistic with token-level (NONE pooling)",
     )
-    results["mlp_sequence_full_pipeline"] = mlp_full_pipeline_result
-    mlp_score_full_pipeline_result = measure_with_warmup(
-        train_probe_full(pl.probes.MLP, score_aggregation="mean"),  # type: ignore
-        warmup_runs=1,
-        measurement_runs=3,
-        name="MLP Score Full Pipeline",
-    )
-    results["mlp_score_full_pipeline"] = mlp_score_full_pipeline_result
+    results["gpu_logistic_token_level"] = gpu_logistic_token_result
 
+    # MLP with MEAN pooling
+    mlp_mean_result = measure_with_warmup(
+        train_probe_full(pl.probes.MLP, sequence_pooling=SequencePooling.MEAN),  # type: ignore
+        warmup_runs=1,
+        measurement_runs=3,
+        name="MLP with MEAN pooling",
+    )
+    results["mlp_mean_pooling"] = mlp_mean_result
+
+    # MLP with token-level (NONE pooling)
+    mlp_token_result = measure_with_warmup(
+        train_probe_full(pl.probes.MLP, sequence_pooling=SequencePooling.NONE),  # type: ignore
+        warmup_runs=1,
+        measurement_runs=3,
+        name="MLP with token-level (NONE pooling)",
+    )
+    results["mlp_token_level"] = mlp_token_result
+
+    # Attention probe (always uses NONE pooling but aggregates internally)
     attention_full_pipeline_result = measure_with_warmup(
-        train_probe_full(pl.probes.Attention),  # type: ignore
+        train_probe_full(pl.probes.Attention, sequence_pooling=SequencePooling.NONE),  # type: ignore
         warmup_runs=1,
         measurement_runs=3,
-        name="Attention Full Pipeline",
+        name="Attention Probe (attention-based aggregation)",
     )
     results["attention_full_pipeline"] = attention_full_pipeline_result
 
     def train_10_probes_full():
         probes = {
             f"logistic_{i}": pl.probes.Logistic(
-                layer=layers[0], sequence_aggregation="mean"
+                layer=layers[0], sequence_pooling=SequencePooling.MEAN
             )
             for i in range(10)
         }

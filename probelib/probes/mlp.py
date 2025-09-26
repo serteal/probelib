@@ -1,22 +1,19 @@
-"""
-Multi-layer perceptron probe implementation following sklearn-style API.
-"""
+"""Multi-layer perceptron probe implementation."""
 
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 
-from ..processing.activations import ActivationIterator, Activations
+from ..processing.activations import ActivationIterator, Activations, SequencePooling
 from .base import BaseProbe
 
 
-class MLPNetwork(nn.Module):
-    """
-    Simple MLP architecture for binary classification.
+class _MLPNetwork(nn.Module):
+    """Simple MLP architecture for binary classification (internal implementation).
 
     Architecture: input -> hidden -> ReLU/GELU -> dropout (optional) -> output
     """
@@ -44,79 +41,61 @@ class MLPNetwork(nn.Module):
 
 
 class MLP(BaseProbe):
-    """
-    Multi-layer perceptron probe for binary classification.
+    """Multi-layer perceptron probe for binary classification.
 
     This probe uses a simple MLP with one hidden layer. It supports
-    both batch and streaming training modes via AdamW optimizer.
-
-    Attributes:
-        hidden_dim: Hidden layer dimension
-        dropout: Dropout probability (None for no dropout)
-        activation: Activation function ("relu" or "gelu")
-        learning_rate: Learning rate for AdamW optimizer
-        weight_decay: L2 regularization strength
-        n_epochs: Maximum number of training epochs
-        patience: Early stopping patience
-        _network: MLPNetwork instance
-        _optimizer: AdamW optimizer (persisted for streaming)
-        _d_model: Input dimension (set during first fit)
+    both batch training and streaming updates via partial_fit.
     """
 
     def __init__(
         self,
-        layer: int,
-        sequence_aggregation: Literal["mean", "max", "last_token"] | None = None,
-        score_aggregation: Literal["mean", "max", "last_token"] | None = None,
+        layer: int | None = None,
+        sequence_pooling: SequencePooling = SequencePooling.MEAN,
         hidden_dim: int = 128,
         dropout: float | None = None,
         activation: Literal["relu", "gelu"] = "relu",
         learning_rate: float = 0.001,
         weight_decay: float = 0.01,
         n_epochs: int = 100,
-        patience: int = 10,
+        batch_size: int = 32,
         device: str | None = None,
         random_state: int | None = None,
         verbose: bool = False,
     ):
-        """
-        Initialize MLP probe.
+        """Initialize MLP probe.
 
         Args:
-            layer: Layer index to use activations from
-            sequence_aggregation: Aggregate sequences BEFORE training (classic)
-            score_aggregation: Train on tokens, aggregate AFTER prediction
-            hidden_dim: Hidden layer dimension
-            dropout: Dropout probability (None for no dropout)
+            layer: Optional layer index for train_probes compatibility
+            sequence_pooling: How to pool sequences before training
+            hidden_dim: Number of hidden units
+            dropout: Dropout rate (None for no dropout)
             activation: Activation function ("relu" or "gelu")
-            learning_rate: Learning rate for AdamW
-            weight_decay: Weight decay for AdamW (L2 regularization)
+            learning_rate: Learning rate for optimizer
+            weight_decay: L2 regularization strength
             n_epochs: Maximum number of training epochs
-            patience: Early stopping patience
-            device: Device for PyTorch operations
+            batch_size: Batch size for training
+            device: Device for computation
             random_state: Random seed for reproducibility
             verbose: Whether to print progress information
         """
-        # Default to sequence_aggregation="mean" if neither is specified
-        if sequence_aggregation is None and score_aggregation is None:
-            sequence_aggregation = "mean"
-
         super().__init__(
             layer=layer,
-            sequence_aggregation=sequence_aggregation,
-            score_aggregation=score_aggregation,
+            sequence_pooling=sequence_pooling,
             device=device,
             random_state=random_state,
             verbose=verbose,
         )
 
+        # Architecture parameters
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.activation = activation
+
+        # Training parameters
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.n_epochs = n_epochs
-        self.patience = patience
+        self.batch_size = batch_size
 
         # Model components (initialized during fit)
         self._network = None
@@ -124,33 +103,37 @@ class MLP(BaseProbe):
         self._d_model = None
         self._streaming_steps = 0
 
-        # This probe requires gradients for training
+        # This probe requires gradients
         self._requires_grad = True
 
-        # Set random seed for reproducibility
+        # Set random seed
         if random_state is not None:
             torch.manual_seed(random_state)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(random_state)
 
-    def _init_network(self, d_model: int):
-        """Initialize the network once we know the input dimension."""
+    def _init_network(self, d_model: int, dtype: torch.dtype | None = None):
+        """Initialize the network and optimizer once we know the input dimension."""
         self._d_model = d_model
-        self._network = MLPNetwork(
+        self._network = _MLPNetwork(
             d_model=d_model,
             hidden_dim=self.hidden_dim,
             dropout=self.dropout,
             activation=self.activation,
         ).to(self.device)
 
+        # Match the dtype of the input features for mixed precision support
+        if dtype is not None:
+            self._network = self._network.to(dtype)
+
         self._optimizer = AdamW(
             self._network.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
-            fused=self.device.startswith("cuda"),
         )
 
-    def fit(self, X: Activations | ActivationIterator, y: list | torch.Tensor) -> Self:
-        """
-        Fit the probe on training data.
+    def fit(self, X: Activations | ActivationIterator, y: list | torch.Tensor) -> "MLP":
+        """Fit the probe on training data.
 
         Args:
             X: Activations or ActivationIterator containing features
@@ -160,113 +143,73 @@ class MLP(BaseProbe):
             self: Fitted probe instance
         """
         if isinstance(X, ActivationIterator):
-            # Use streaming approach for iterators
-            return self._fit_iterator(X, y)
+            # Use streaming for iterators
+            labels = self._prepare_labels(y)
+            for batch_acts in X:
+                batch_idx = torch.tensor(batch_acts.batch_indices, device=labels.device, dtype=torch.long)
+                batch_labels = labels.index_select(0, batch_idx)
+                self.partial_fit(batch_acts, batch_labels)
+            return self
 
-        # Standard batch fitting
+        # Prepare features and labels
         features = self._prepare_features(X)
         labels = self._prepare_labels(
-            y, expand_for_tokens=(self.sequence_aggregation is None)
+            y, expand_for_tokens=(self.sequence_pooling == SequencePooling.NONE)
         )
 
-        # Move to device and ensure float32 for MLP compatibility
-        features = features.to(self.device).float()
-        labels = labels.to(self.device).float()
+        # Skip if no features
+        if features.shape[0] == 0:
+            if self.verbose:
+                print("No features to train on (empty batch)")
+            return self
 
-        # Validate we have both classes
-        unique_labels = torch.unique(labels)
-        if len(unique_labels) < 2:
-            raise ValueError(
-                f"Training data must contain both classes. Found: {unique_labels.tolist()}"
-            )
+        # Move to device
+        features = features.to(self.device)
+        labels = labels.to(self.device).float()  # Labels should be float for BCE loss
 
         # Initialize network if needed
         if self._network is None:
-            self._init_network(features.shape[1])
+            self._init_network(features.shape[1], dtype=features.dtype)
 
-        # Create train/validation split
-        n_samples = len(features)
-        n_val = max(1, int(0.2 * n_samples))  # At least 1 validation sample
+        # Create dataset and dataloader
+        dataset = torch.utils.data.TensorDataset(features, labels)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=False,
+        )
 
-        if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-        indices = torch.randperm(n_samples, device=self.device)
-
-        train_indices = indices[n_val:]
-        val_indices = indices[:n_val]
-
-        X_train = features[train_indices]
-        y_train = labels[train_indices]
-        X_val = features[val_indices]
-        y_val = labels[val_indices]
-
-        # Training loop with early stopping
-        best_val_loss = float("inf")
-        patience_counter = 0
-
+        # Training loop
         self._network.train()
         for epoch in range(self.n_epochs):
-            # Training step
-            self._optimizer.zero_grad()
-            logits = self._network(X_train)
-            loss = F.binary_cross_entropy_with_logits(logits, y_train)
-            loss.backward()
-            self._optimizer.step()
+            total_loss = 0
+            n_batches = 0
 
-            # Validation step
-            self._network.eval()
-            with torch.no_grad():
-                val_logits = self._network(X_val)
-                val_loss = F.binary_cross_entropy_with_logits(val_logits, y_val)
-            self._network.train()
+            for batch_features, batch_labels in dataloader:
+                # Forward pass
+                self._optimizer.zero_grad()
+                outputs = self._network(batch_features)
+                loss = F.binary_cross_entropy_with_logits(outputs, batch_labels)
 
-            # Early stopping check
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= self.patience:
-                    if self.verbose:
-                        print(f"Early stopping at epoch {epoch}")
-                    break
+                # Backward pass
+                loss.backward()
+                self._optimizer.step()
 
-            # Stop if loss is very small
-            if val_loss < 0.01:
-                if self.verbose:
-                    print(f"Converged at epoch {epoch}")
-                break
+                total_loss += loss.item()
+                n_batches += 1
+
+            # Print progress
+            if self.verbose and (epoch + 1) % 10 == 0:
+                avg_loss = total_loss / n_batches
+                print(f"Epoch {epoch + 1}/{self.n_epochs}: loss={avg_loss:.4f}")
 
         self._network.eval()
         self._fitted = True
         return self
 
-    def _fit_iterator(self, X: ActivationIterator, y: list | torch.Tensor) -> Self:
-        """
-        Fit using an ActivationIterator (streaming mode).
-
-        Args:
-            X: ActivationIterator yielding batches of activations
-            y: All labels
-
-        Returns:
-            self: Fitted probe instance
-        """
-        labels_tensor = self._prepare_labels(y)
-
-        # Process batches
-        for batch_acts in X:
-            batch_idx = torch.tensor(
-                batch_acts.batch_indices, device=labels_tensor.device, dtype=torch.long
-            )
-            batch_labels = labels_tensor.index_select(0, batch_idx)
-            self.partial_fit(batch_acts, batch_labels)
-
-        return self
-
-    def partial_fit(self, X: Activations, y: list | torch.Tensor) -> Self:
-        """
-        Incrementally fit the probe on a batch of samples.
+    def partial_fit(self, X: Activations, y: list | torch.Tensor) -> "MLP":
+        """Incrementally fit the probe on a batch of samples.
 
         Args:
             X: Activations containing features for this batch
@@ -275,37 +218,44 @@ class MLP(BaseProbe):
         Returns:
             self: Partially fitted probe instance
         """
+        # Prepare features and labels
         features = self._prepare_features(X)
         labels = self._prepare_labels(
-            y, expand_for_tokens=(self.sequence_aggregation is None)
+            y, expand_for_tokens=(self.sequence_pooling == SequencePooling.NONE)
         )
 
-        # Move to device and ensure float32 for MLP compatibility
-        features = features.to(self.device).float()
-        labels = labels.to(self.device).float()
+        # Skip empty batches
+        if features.shape[0] == 0:
+            if self.verbose:
+                print("Skipping batch with no features")
+            return self
 
-        # Initialize network on first batch
+        # Move to device
+        features = features.to(self.device)
+        labels = labels.to(self.device).float()  # Labels should be float for BCE loss
+
+        # Initialize network if this is the first batch
         if self._network is None:
-            self._init_network(features.shape[1])
+            self._init_network(features.shape[1], dtype=features.dtype)
 
-        # Training step
+        # Single optimization step on this batch
         self._network.train()
         self._optimizer.zero_grad()
-        logits = self._network(features)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        outputs = self._network(features)
+        loss = F.binary_cross_entropy_with_logits(outputs, labels)
         loss.backward()
         self._optimizer.step()
 
         self._streaming_steps += 1
-        self._fitted = True
+        if self.verbose and self._streaming_steps % 10 == 0:
+            print(f"Streaming step {self._streaming_steps}: loss={loss.item():.4f}")
 
-        # Switch back to eval mode
         self._network.eval()
+        self._fitted = True
         return self
 
     def predict_proba(self, X: Activations | ActivationIterator) -> torch.Tensor:
-        """
-        Predict class probabilities.
+        """Predict class probabilities.
 
         Args:
             X: Activations or ActivationIterator containing features
@@ -318,62 +268,29 @@ class MLP(BaseProbe):
 
         if isinstance(X, ActivationIterator):
             # Predict on iterator batches
-            return self._predict_iterator(X)
+            predictions = []
+            for batch_acts in X:
+                batch_probs = self.predict_proba(batch_acts)
+                predictions.append(batch_probs)
+            return torch.cat(predictions, dim=0)
 
-        # Standard prediction - always aggregate for prediction
-        # Get features based on training mode
+        # Prepare features
         features = self._prepare_features(X)
-        features = features.to(self.device).float()  # Ensure float32 for MLP
+        features = features.to(self.device)
 
         # Get predictions
         self._network.eval()
         with torch.no_grad():
             logits = self._network(features)
-
-            # Apply score aggregation if needed (aggregate logits, not probabilities)
-            if self.score_aggregation is not None and hasattr(
-                self, "_tokens_per_sample"
-            ):
-                # Aggregate logits before applying sigmoid
-                logits = self._aggregate_scores(
-                    logits.unsqueeze(-1), self.score_aggregation
-                ).squeeze(-1)
-
             probs_positive = torch.sigmoid(logits)
 
         # Create 2-class probability matrix
-        n_predictions = len(probs_positive)
-        probs = torch.zeros(n_predictions, 2, device=self.device)
-        probs[:, 0] = 1 - probs_positive  # P(y=0)
-        probs[:, 1] = probs_positive  # P(y=1)
+        probs = torch.stack([1 - probs_positive, probs_positive], dim=-1)
 
         return probs
 
-    def _predict_iterator(self, X: ActivationIterator) -> torch.Tensor:
-        """
-        Predict on an ActivationIterator.
-
-        Args:
-            X: ActivationIterator yielding batches
-
-        Returns:
-            Concatenated predictions for all batches
-        """
-        all_probs = []
-
-        for batch_acts in X:
-            batch_probs = self.predict_proba(batch_acts)
-            all_probs.append(batch_probs)
-
-        return torch.cat(all_probs, dim=0)
-
     def save(self, path: Path | str) -> None:
-        """
-        Save the probe to disk.
-
-        Args:
-            path: Path to save the probe
-        """
+        """Save the probe to disk."""
         if not self._fitted:
             raise RuntimeError("Cannot save unfitted probe")
 
@@ -383,69 +300,56 @@ class MLP(BaseProbe):
         # Prepare state dict
         state = {
             "layer": self.layer,
-            "sequence_aggregation": self.sequence_aggregation,
-            "score_aggregation": self.score_aggregation,
+            "sequence_pooling": self.sequence_pooling.value,  # Save enum value
             "hidden_dim": self.hidden_dim,
             "dropout": self.dropout,
             "activation": self.activation,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
             "n_epochs": self.n_epochs,
-            "patience": self.patience,
-            "device": self.device,
-            "random_state": self.random_state,
-            "verbose": self.verbose,
+            "batch_size": self.batch_size,
             "d_model": self._d_model,
-            "network_state_dict": self._network.state_dict(),
-            "optimizer_state_dict": self._optimizer.state_dict(),
-            "streaming_steps": self._streaming_steps,
+            "network_state": self._network.state_dict(),
+            "random_state": self.random_state,
         }
 
         torch.save(state, path)
 
     @classmethod
-    def load(cls, path: Path | str, device: str | None = None) -> Self:
-        """
-        Load a probe from disk.
-
-        Args:
-            path: Path to load the probe from
-            device: Device to load onto (None to use saved device)
-
-        Returns:
-            Loaded probe instance
-        """
+    def load(cls, path: Path | str, device: str | None = None) -> "MLP":
+        """Load a probe from disk."""
         path = Path(path)
-        state = torch.load(path, map_location="cpu")
+        if not path.exists():
+            raise FileNotFoundError(f"Probe file not found: {path}")
+
+        # Load state dict
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        state = torch.load(path, map_location=device)
+
+        # Convert sequence_pooling string back to enum
+        pooling_value = state.get("sequence_pooling", "mean")
+        sequence_pooling = SequencePooling(pooling_value)
 
         # Create probe instance
         probe = cls(
             layer=state["layer"],
-            sequence_aggregation=state["sequence_aggregation"],
-            score_aggregation=state["score_aggregation"],
+            sequence_pooling=sequence_pooling,
             hidden_dim=state["hidden_dim"],
-            dropout=state["dropout"],
+            dropout=state.get("dropout"),
             activation=state["activation"],
             learning_rate=state["learning_rate"],
             weight_decay=state["weight_decay"],
             n_epochs=state["n_epochs"],
-            patience=state["patience"],
-            device=device or state["device"],
-            random_state=state["random_state"],
-            verbose=state.get("verbose", False),
+            batch_size=state["batch_size"],
+            device=device,
+            random_state=state.get("random_state"),
         )
 
-        # Initialize network
+        # Initialize network and load state
         probe._init_network(state["d_model"])
-
-        # Load network and optimizer states
-        probe._network.load_state_dict(state["network_state_dict"])
-        probe._optimizer.load_state_dict(state["optimizer_state_dict"])
-        probe._streaming_steps = state["streaming_steps"]
-
-        # Move to correct device
-        probe._network = probe._network.to(probe.device)
-        probe._network.eval()
+        probe._network.load_state_dict(state["network_state"])
         probe._fitted = True
 
         return probe

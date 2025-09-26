@@ -9,6 +9,7 @@ import torch
 from probelib.probes import MLP, Logistic
 from probelib.processing.activations import Activations
 from probelib.types import Label
+from probelib.processing import SequencePooling
 
 
 class TestEmptyBatchHandling:
@@ -54,7 +55,7 @@ class TestEmptyBatchHandling:
 
     def test_logistic_probe_empty_batch(self, empty_activations, normal_activations):
         """Test that LogisticProbe handles empty batches in partial_fit."""
-        probe = Logistic(layer=12, score_aggregation="mean", verbose=True)
+        probe = Logistic(layer=12, sequence_pooling=SequencePooling.NONE, verbose=True)
         labels = [Label.POSITIVE, Label.NEGATIVE]
 
         # First fit with normal batch to initialize
@@ -71,7 +72,7 @@ class TestEmptyBatchHandling:
 
     def test_logistic_probe_all_empty_batches(self, empty_activations):
         """Test LogisticProbe when all batches are empty."""
-        probe = Logistic(layer=12, score_aggregation="mean", verbose=True)
+        probe = Logistic(layer=12, sequence_pooling=SequencePooling.NONE, verbose=True)
         labels = [Label.POSITIVE, Label.NEGATIVE]
 
         # Try to fit with only empty batches
@@ -83,7 +84,7 @@ class TestEmptyBatchHandling:
 
     def test_mlp_probe_empty_batch(self, empty_activations, normal_activations):
         """Test that MLPProbe handles empty batches in partial_fit."""
-        probe = MLP(layer=12, score_aggregation="mean", verbose=True)
+        probe = MLP(layer=12, sequence_pooling=SequencePooling.NONE, verbose=True)
         labels = [Label.POSITIVE, Label.NEGATIVE]
 
         # First fit with normal batch to initialize
@@ -101,7 +102,7 @@ class TestEmptyBatchHandling:
 
     def test_mixed_batches_streaming(self, empty_activations, normal_activations):
         """Test streaming training with a mix of empty and non-empty batches."""
-        probe = Logistic(layer=12, score_aggregation="mean", verbose=False)
+        probe = Logistic(layer=12, sequence_pooling=SequencePooling.NONE, verbose=False)
 
         # Simulate streaming training
         labels = [Label.POSITIVE, Label.NEGATIVE]
@@ -153,7 +154,7 @@ class TestEmptyBatchHandling:
             "Tokens per sample should be [10, 0, 5]"
         )
 
-    def test_probe_with_sequence_aggregation_empty_samples(self):
+    def test_probe_with_sequence_pooling_empty_samples(self):
         """Test sequence aggregation with some samples having no detected tokens."""
         batch_size = 3
         seq_len = 50
@@ -229,8 +230,8 @@ class TestStreamingWorkflow:
             layer_indices=[12],
         )
 
-        # Test with score_aggregation probe
-        probe = Logistic(layer=12, score_aggregation="mean")
+        # Test with token-level probe
+        probe = Logistic(layer=12, sequence_pooling=SequencePooling.NONE)
         labels = [Label.POSITIVE, Label.NEGATIVE]
 
         # Extract features for score aggregation

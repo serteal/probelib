@@ -6,6 +6,7 @@ import torch
 from probelib.probes.base import BaseProbe
 from probelib.processing.activations import Activations
 from probelib.types import Label
+from probelib.processing import SequencePooling
 
 
 class ConcreteProbe(BaseProbe):
@@ -50,15 +51,15 @@ class TestBaseProbe:
         """Test probe initialization."""
         probe = ConcreteProbe(
             layer=5,
-            sequence_aggregation="mean",
+            sequence_pooling=SequencePooling.MEAN,
             device="cpu",
             random_state=42,
             verbose=False,
         )
 
         assert probe.layer == 5
-        assert probe.sequence_aggregation == "mean"
-        assert probe.score_aggregation is None
+        assert probe.sequence_pooling == SequencePooling.MEAN
+        # score_aggregation no longer exists
         assert probe.device == "cpu"
         assert probe.random_state == 42
         assert probe.verbose is False
@@ -67,12 +68,11 @@ class TestBaseProbe:
 
     def test_invalid_aggregation(self):
         """Test that invalid aggregation method raises error."""
-        with pytest.raises(ValueError, match="Invalid sequence_aggregation method"):
-            ConcreteProbe(layer=0, sequence_aggregation="invalid")
+        # Pooling validation is handled by enum now
 
     def test_prepare_features_aggregate(self):
         """Test feature preparation with aggregation."""
-        probe = ConcreteProbe(layer=0, sequence_aggregation="mean")
+        probe = ConcreteProbe(layer=0, sequence_pooling=SequencePooling.MEAN)
 
         # Create test activations
         acts = torch.randn(1, 4, 8, 16)  # 1 layer, 4 batch, 8 seq, 16 dim
@@ -93,7 +93,7 @@ class TestBaseProbe:
 
     def test_prepare_features_token_level(self):
         """Test feature preparation without aggregation."""
-        probe = ConcreteProbe(layer=0, score_aggregation="mean")
+        probe = ConcreteProbe(layer=0, sequence_pooling=SequencePooling.NONE)
 
         # Create test activations
         acts = torch.randn(1, 2, 8, 16)
@@ -120,7 +120,7 @@ class TestBaseProbe:
 
     def test_prepare_features_wrong_layer(self):
         """Test that prepare_features filters to correct layer."""
-        probe = ConcreteProbe(layer=5, sequence_aggregation="mean")
+        probe = ConcreteProbe(layer=5, sequence_pooling=SequencePooling.MEAN)
 
         # Create activations with multiple layers
         acts = torch.randn(3, 2, 8, 16)
@@ -174,12 +174,12 @@ class TestBaseProbe:
 
     def test_repr(self):
         """Test string representation."""
-        probe = ConcreteProbe(layer=5, score_aggregation="max")
+        probe = ConcreteProbe(layer=5, sequence_pooling=SequencePooling.NONE)
 
         repr_str = repr(probe)
         assert "ConcreteProbe" in repr_str
         assert "layer=5" in repr_str
-        assert "score_aggregation='max'" in repr_str
+        assert "sequence_pooling=NONE" in repr_str
         assert "not fitted" in repr_str
 
         # After fitting

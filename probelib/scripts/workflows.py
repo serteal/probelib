@@ -152,11 +152,9 @@ def _train_probes_batch(
         )
 
     for name, probe in probes.items():
-        # Get activations for this probe's layers
-        probe_acts = activations.filter_layers([probe.layer])
-
-        # Train probe
-        probe.fit(probe_acts, labels)
+        # Each probe will handle layer selection internally if needed
+        # The activations should already have the right layers collected
+        probe.fit(activations, labels)
 
 
 def _train_probes_streaming(
@@ -335,11 +333,9 @@ def _evaluate_probes_batch(
     all_metrics = {}
 
     for name, probe in probes.items():
-        # Get probe-specific activations
-        probe_acts = activations.filter_layers([probe.layer])
-
+        # Probes handle layer selection internally
         # Make predictions (predict_proba returns [n_samples, 2])
-        probs = probe.predict_proba(probe_acts)
+        probs = probe.predict_proba(activations)
         # Get positive class probabilities
         preds = probs[:, 1]
 
@@ -414,8 +410,8 @@ def _evaluate_probes_streaming(
 
         # Get predictions for each probe
         for name, probe in probes.items():
-            probe_batch_acts = batch_activations.filter_layers([probe.layer])
-            probs = probe.predict_proba(probe_batch_acts)
+            # Probes handle layer selection internally
+            probs = probe.predict_proba(batch_activations)
             # Get positive class probabilities and store in correct positions
             preds = probs[:, 1]
             # Ensure preds is on the same device as probe_predictions

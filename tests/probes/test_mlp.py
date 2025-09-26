@@ -9,6 +9,7 @@ import torch
 from probelib.probes.mlp import MLP
 from probelib.processing.activations import Activations
 from probelib.types import Label
+from probelib.processing import SequencePooling
 
 
 def create_test_activations(n_samples=10, seq_len=20, d_model=16, layer=0):
@@ -69,7 +70,7 @@ class TestMLP:
             weight_decay=0.05,
             n_epochs=200,
             patience=10,
-            sequence_aggregation="max",
+            sequence_pooling=SequencePooling.MAX,
             device="cpu",
             random_state=42,
             verbose=False,
@@ -83,8 +84,8 @@ class TestMLP:
         assert probe.weight_decay == 0.05
         assert probe.n_epochs == 200
         assert probe.patience == 10
-        assert probe.sequence_aggregation == "max"
-        assert probe.score_aggregation is None
+        assert probe.sequence_pooling == SequencePooling.MAX
+        # score_aggregation no longer exists
         assert probe._fitted is False
         assert probe._network is None
 
@@ -136,7 +137,7 @@ class TestMLP:
     def test_predict_before_fit(self):
         """Test that prediction fails before fitting."""
         activations = create_test_activations()
-        probe = MLP(layer=0, sequence_aggregation="mean", device="cpu")
+        probe = MLP(layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu")
 
         with pytest.raises(RuntimeError, match="Probe must be fitted"):
             probe.predict_proba(activations)
@@ -148,7 +149,7 @@ class TestMLP:
         probe = MLP(
             layer=0,
             hidden_dim=16,
-            score_aggregation="mean",  # Token-level training with score aggregation
+            sequence_pooling=SequencePooling.NONE,  # Token-level training with score aggregation
             n_epochs=50,
             device="cpu",
             random_state=42,
@@ -193,7 +194,7 @@ class TestMLP:
             probe = MLP(
                 layer=0,
                 hidden_dim=16,
-                sequence_aggregation=method,
+                sequence_pooling=SequencePooling(method),
                 n_epochs=50,
                 device="cpu",
                 random_state=42,
@@ -241,7 +242,7 @@ class TestMLP:
         for activation in ["relu", "gelu"]:
             probe = MLP(
                 layer=0,
-                sequence_aggregation="mean",
+                sequence_pooling=SequencePooling.MEAN,
                 hidden_dim=16,
                 activation=activation,
                 n_epochs=50,

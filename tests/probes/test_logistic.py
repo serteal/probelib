@@ -12,6 +12,7 @@ from probelib.processing.activations import (
     Activations,
 )
 from probelib.types import Label
+from probelib.processing import SequencePooling
 
 
 class MockActivationIterator(ActivationIterator):
@@ -95,7 +96,7 @@ class TestLogistic:
         """Test probe initialization."""
         probe = Logistic(
             layer=5,
-            sequence_aggregation="mean",
+            sequence_pooling=SequencePooling.MEAN,
             l2_penalty=0.1,
             device="cpu",
             random_state=42,
@@ -103,8 +104,8 @@ class TestLogistic:
         )
 
         assert probe.layer == 5
-        assert probe.sequence_aggregation == "mean"
-        assert probe.score_aggregation is None
+        assert probe.sequence_pooling == SequencePooling.MEAN
+        # score_aggregation no longer exists
         assert probe.l2_penalty == 0.1
         assert probe.device == "cpu"
         assert probe.random_state == 42
@@ -116,7 +117,7 @@ class TestLogistic:
 
         probe = Logistic(
             layer=0,
-            sequence_aggregation="mean",
+            sequence_pooling=SequencePooling.MEAN,
             device="cpu",
         )
 
@@ -133,7 +134,7 @@ class TestLogistic:
 
         probe = Logistic(
             layer=0,
-            score_aggregation="mean",  # Token-level training with score aggregation
+            sequence_pooling=SequencePooling.NONE,  # Token-level training with score aggregation
             device="cpu",
         )
 
@@ -147,7 +148,7 @@ class TestLogistic:
         activations, labels = create_separable_data(n_samples=20)
 
         probe = Logistic(
-            layer=0, sequence_aggregation="mean", device="cpu", random_state=42
+            layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu", random_state=42
         )
         probe.fit(activations, labels)
 
@@ -168,7 +169,7 @@ class TestLogistic:
     def test_predict_before_fit(self):
         """Test that prediction fails before fitting."""
         activations = create_test_activations()
-        probe = Logistic(layer=0, sequence_aggregation="mean", device="cpu")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu")
 
         with pytest.raises(RuntimeError, match="Probe must be fitted"):
             probe.predict_proba(activations)
@@ -180,7 +181,7 @@ class TestLogistic:
         batch2_acts, batch2_labels = create_separable_data(n_samples=10)
 
         probe = Logistic(
-            layer=0, sequence_aggregation="mean", device="cpu", random_state=42
+            layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu", random_state=42
         )
 
         # Fit on first batch
@@ -207,7 +208,7 @@ class TestLogistic:
         # All labels
         labels = [Label.POSITIVE] * 10 + [Label.NEGATIVE] * 10
 
-        probe = Logistic(layer=0, sequence_aggregation="mean", device="cpu")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu")
         probe.fit(iterator, labels)
 
         assert probe._fitted is True
@@ -217,7 +218,7 @@ class TestLogistic:
         # Train probe first
         train_acts, train_labels = create_separable_data(n_samples=20)
         probe = Logistic(
-            layer=0, sequence_aggregation="mean", device="cpu", random_state=42
+            layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu", random_state=42
         )
         probe.fit(train_acts, train_labels)
 
@@ -239,7 +240,7 @@ class TestLogistic:
         for method in ["mean", "max", "last_token"]:
             probe = Logistic(
                 layer=0,
-                sequence_aggregation=method,
+                sequence_pooling=SequencePooling(method),
                 device="cpu",
                 random_state=42,
             )
@@ -257,7 +258,7 @@ class TestLogistic:
         # Train probe
         probe = Logistic(
             layer=0,  # Match the layer in test data
-            sequence_aggregation="max",
+            sequence_pooling=SequencePooling.MAX,
             l2_penalty=0.5,
             device="cpu",
             random_state=42,
@@ -276,8 +277,8 @@ class TestLogistic:
 
             # Check attributes preserved
             assert loaded_probe.layer == 0
-            assert loaded_probe.sequence_aggregation == "max"
-            assert loaded_probe.score_aggregation is None
+            assert loaded_probe.sequence_pooling == SequencePooling.MAX
+            # score_aggregation no longer exists
             assert loaded_probe.l2_penalty == 0.5
             assert loaded_probe._fitted is True
 
@@ -287,7 +288,7 @@ class TestLogistic:
 
     def test_save_unfitted_probe(self):
         """Test that saving unfitted probe raises error."""
-        probe = Logistic(layer=0, sequence_aggregation="mean", device="cpu")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             save_path = Path(tmpdir) / "probe.pt"
@@ -299,7 +300,7 @@ class TestLogistic:
         activations, labels = create_separable_data(n_samples=20)
 
         # Train on CPU
-        probe = Logistic(layer=0, sequence_aggregation="mean", device="cpu")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu")
         probe.fit(activations, labels)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -318,7 +319,7 @@ class TestLogistic:
         # (handled by PyTorch loss function)
 
         # Test with wrong layer
-        probe = Logistic(layer=5, sequence_aggregation="mean", device="cpu")
+        probe = Logistic(layer=5, sequence_pooling=SequencePooling.MEAN, device="cpu")
         with pytest.raises(ValueError, match="Layer 5 not found"):
             probe.fit(activations, [Label.POSITIVE] * 5 + [Label.NEGATIVE] * 5)
 
@@ -327,7 +328,7 @@ class TestLogistic:
         batch1_acts, batch1_labels = create_separable_data(n_samples=10)
         batch2_acts, batch2_labels = create_separable_data(n_samples=10)
 
-        probe = Logistic(layer=0, sequence_aggregation="mean", device="cpu")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN, device="cpu")
 
         # First do regular fit
         probe.fit(batch1_acts, batch1_labels)
@@ -344,7 +345,7 @@ class TestLogistic:
         for method in ["mean", "max", "last_token"]:
             probe = Logistic(
                 layer=0,
-                score_aggregation=method,  # Token-level training with score aggregation
+                sequence_pooling=SequencePooling.NONE,  # Token-level training
                 device="cpu",
                 random_state=42,
             )
@@ -357,25 +358,3 @@ class TestLogistic:
             assert torch.all(probs >= 0) and torch.all(probs <= 1)
             assert torch.allclose(probs.sum(dim=1), torch.ones(10))
 
-    def test_aggregation_validation(self):
-        """Test that Logistic probe requires at least one aggregation."""
-        # Should raise error when both aggregations are None
-        with pytest.raises(
-            ValueError,
-            match="requires either sequence_aggregation or score_aggregation",
-        ):
-            Logistic(
-                layer=0,
-                sequence_aggregation=None,
-                score_aggregation=None,
-                device="cpu",
-            )
-
-        # Should raise error when both aggregations are set
-        with pytest.raises(ValueError, match="Cannot use both"):
-            Logistic(
-                layer=0,
-                sequence_aggregation="mean",
-                score_aggregation="mean",
-                device="cpu",
-            )
