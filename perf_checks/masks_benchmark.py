@@ -4,9 +4,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from utils import TimingResult, measure_with_warmup, timer
 
 import probelib as pl
-from benchmarks.utils import TimingResult, measure_with_warmup, timer
 from probelib.masks import (
     after,
     assistant,

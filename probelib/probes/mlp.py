@@ -122,9 +122,9 @@ class MLP(BaseProbe):
             activation=self.activation,
         ).to(self.device)
 
-        # Match the dtype of the input features for mixed precision support
-        if dtype is not None:
-            self._network = self._network.to(dtype)
+        # Always use float32 for MLP weights to avoid numerical issues
+        # with float16/bfloat16 models that have extreme activation values
+        self._network = self._network.to(torch.float32)
 
         self._optimizer = AdamW(
             self._network.parameters(),
@@ -163,13 +163,13 @@ class MLP(BaseProbe):
                 print("No features to train on (empty batch)")
             return self
 
-        # Move to device
-        features = features.to(self.device)
+        # Move to device and convert to float32 to avoid numerical issues
+        features = features.to(self.device, dtype=torch.float32)
         labels = labels.to(self.device).float()  # Labels should be float for BCE loss
 
         # Initialize network if needed
         if self._network is None:
-            self._init_network(features.shape[1], dtype=features.dtype)
+            self._init_network(features.shape[1], dtype=torch.float32)
 
         # Create dataset and dataloader
         dataset = torch.utils.data.TensorDataset(features, labels)
@@ -230,13 +230,13 @@ class MLP(BaseProbe):
                 print("Skipping batch with no features")
             return self
 
-        # Move to device
-        features = features.to(self.device)
+        # Move to device and convert to float32 to avoid numerical issues
+        features = features.to(self.device, dtype=torch.float32)
         labels = labels.to(self.device).float()  # Labels should be float for BCE loss
 
         # Initialize network if this is the first batch
         if self._network is None:
-            self._init_network(features.shape[1], dtype=features.dtype)
+            self._init_network(features.shape[1], dtype=torch.float32)
 
         # Single optimization step on this batch
         self._network.train()
@@ -274,9 +274,9 @@ class MLP(BaseProbe):
                 predictions.append(batch_probs)
             return torch.cat(predictions, dim=0)
 
-        # Prepare features
+        # Prepare features and convert to float32 for consistency
         features = self._prepare_features(X)
-        features = features.to(self.device)
+        features = features.to(self.device, dtype=torch.float32)
 
         # Get predictions
         self._network.eval()

@@ -42,7 +42,14 @@ from probelib.datasets import DialogueDataset, CircuitBreakersDataset, DolusChat
 from probelib.metrics import auroc, recall_at_fpr, get_metric_by_name
 
 # Visualization
-from probelib.visualization import print_metrics
+from probelib.visualization import print_metrics, visualize_mask
+
+# Masks for selective token processing
+from probelib import masks
+
+# Integration utilities for external frameworks
+from probelib import integrations
+from probelib.integrations import dialogue_from_inspect_messages, dialogue_to_inspect_messages
 ```
 
 ## Commands
@@ -132,9 +139,12 @@ The `dev` dependency group includes:
 uv run jupyter notebook
 
 # Run example scripts
-uv run python examples/train_streaming_simple.py  # Simple streaming training
-uv run python examples/perf_example.py            # Performance benchmarking
-uv run python examples/dolus_chat.py              # Interactive deception chat demo
+uv run python examples/train_streaming_simple.py       # Simple streaming training with multiple probes
+uv run python examples/mask_showcase.py                # Comprehensive mask function demonstration
+uv run python examples/simple_probe_monitor.py         # Complete probe monitoring workflow (RECOMMENDED)
+uv run python examples/inspect_probe_monitor.py        # Real inspect_ai integration with probe monitors
+uv run python examples/inspect_ai_monitor_example.py   # inspect_ai integration concepts and patterns
+uv run python examples/dolus_chat.py                   # Interactive deception chat demo
 ```
 
 ## Architecture Overview
@@ -171,6 +181,16 @@ probelib/
 │   ├── logistic.py     # Logistic regression probes
 │   ├── mlp.py          # MLP probe
 │   └── attention.py    # Attention-based probe
+├── masks/               # Mask functions for selective token processing
+│   ├── base.py         # MaskFunction base class
+│   ├── basic.py        # Basic masks (all, none, last_token, etc.)
+│   ├── role.py         # Role-based masks (assistant, user, system)
+│   ├── text.py         # Text matching masks (contains, regex)
+│   ├── position.py     # Position masks (between, after, before, nth_message)
+│   ├── content.py      # Content masks (special_tokens, padding)
+│   └── composite.py    # Composite masks (AndMask, OrMask, NotMask)
+├── integrations/        # External framework integration utilities
+│   └── dialogue_conversion.py  # Convert between probelib and external formats
 ├── scripts/             # High-level workflows
 │   └── workflows.py    # train_probes, evaluate_probes
 ├── metrics.py           # Function-based metrics API
@@ -207,22 +227,27 @@ probelib/
 
 3. **Models (`models/`)**: LLM interfaces
 
-   - `HookedModel`: Context manager for activation extraction
-   - Architecture-specific handlers (LLaMA, Gemma)
+   - `HookedModel`: Context manager for activation extraction with `hook_point` control
+   - Hook points:
+     - `"post_block"` (default): After attention + MLP, after final layernorm
+     - `"pre_layernorm"`: Before the initial layernorm in each layer
+   - Architecture-specific handlers (LLaMA, Gemma, etc.)
    - Automatic layer detection and hook management
    - Memory-efficient activation collection
 
 4. **Processing (`processing/`)**: Data transformation pipeline
 
    - `collect_activations`: Extract hidden states from models (main API)
-   - `Activations`: Container class with methods:
-     - `aggregate()`: Aggregate over sequence (mean, max, last_token)
-     - `to_token_level()`: Extract token-level features
-     - `filter_layers()`: Filter to specific layers
+   - `Activations`: Axis-aware container class with methods:
+     - `from_tensor()`: Create from pre-stacked 4D tensor [layer, batch, seq, hidden]
+     - `from_hidden_states()`: Create from HuggingFace nested tuple format or tensor
+     - `pool()`: Unified pooling over sequence or layer dimension (mean, max, last_token)
+     - `select()`: Unified layer selection (single layer or multiple)
      - `to()`: Device/dtype conversion
+     - Properties: `n_layers`, `batch_size`, `seq_len`, `d_model`, `layer_indices`
    - `ActivationIterator`: Memory-efficient streaming wrapper
-   - `tokenize_dialogues`: Convert dialogues to model inputs
-   - `create_detection_mask`: Mark tokens for probe training
+   - `tokenize_dialogues`: Convert dialogues to model inputs with mask support
+   - `tokenize_dataset`: Batch tokenization for datasets
 
 5. **Probes (`probes/`)**: Classifier implementations
 
@@ -254,18 +279,49 @@ probelib/
 8. **Visualization (`visualization.py`)**: Result visualization
    - ROC and precision-recall curves
    - Recall comparison bar charts
-   - Detection mask visualization
+   - Detection mask visualization with `visualize_mask()`
    - Modern plotting theme with accessibility
+
+9. **Masks (`masks/`)**: Selective token processing
+
+   - **MaskFunction**: Base class for composable mask functions
+   - **Basic masks**: `all()`, `none()`, `last_token()`, `first_n_tokens()`, `last_n_tokens()`
+   - **Role masks**: `assistant()`, `user()`, `system()`, `role()` for custom roles
+   - **Text masks**: `contains()`, `regex()` for pattern matching
+   - **Position masks**: `between()`, `after()`, `before()`, `nth_message()`, `padding()`
+   - **Content masks**: `special_tokens()` for filtering special tokens
+   - **Composite masks**: `AndMask`, `OrMask`, `NotMask` for boolean logic
+   - Used with `collect_activations(mask=...)` to control which tokens are detected
+   - All masks are composable and chainable
+
+10. **Integrations (`integrations/`)**: External framework utilities
+
+    - `dialogue_from_inspect_messages()`: Convert inspect_ai ChatMessage → probelib Dialogue
+    - `dialogue_to_inspect_messages()`: Convert probelib Dialogue → inspect_ai format
+    - Enables using probelib probes as monitors/solvers in inspect_ai and control-arena
+    - Detection control via mask functions during tokenization (not in dialogue)
 
 ### Key Design Patterns
 
-1. **Detection-First Design**
+1. **Axis-Aware Activations**
 
-   - The `detect` flag on messages controls training data
-   - Allows fine-grained control over which parts of conversations to use
-   - Essential for avoiding label leakage in dialogue contexts
+   - `Activations` tracks which dimensions exist via `axes` tuple
+   - Standard axes: `[LAYER, BATCH, SEQ, HIDDEN]`
+   - Operations automatically handle axis presence/removal:
+     - `select(layers=16)` removes LAYER axis → `[BATCH, SEQ, HIDDEN]`
+     - `pool(dim="sequence")` removes SEQ axis → `[LAYER, BATCH, HIDDEN]`
+   - Properties adapt to available axes (`n_layers`, `batch_size`, `seq_len`, `d_model`)
+   - Enables safe chaining of transformations without shape confusion
 
-2. **Memory Efficiency**
+2. **Mask-Based Detection Control**
+
+   - Mask functions control which tokens are detected during activation collection
+   - Composable via boolean logic (AndMask, OrMask, NotMask)
+   - Applied during tokenization, not on dialogues
+   - Examples: `pl.masks.assistant()`, `pl.masks.nth_message(-1)`, `pl.masks.contains("yes")`
+   - Replaces old `detect` flag on messages for cleaner separation of concerns
+
+3. **Memory Efficiency**
 
    - Streaming activation collection via `ActivationIterator`
    - Automatic streaming detection based on dataset size
@@ -275,15 +331,15 @@ probelib/
    - Activation caching with deterministic hashing
    - `partial_fit()` support for incremental training
 
-3. **Unified Interfaces**
+4. **Unified Interfaces**
 
    - Single `train_probes` function for all probe types
-   - Consistent configuration via `ProbeConfig`
-   - Automatic format detection and conversion
+   - Unified `pool()` and `select()` methods for activation manipulation
+   - Automatic format detection (DialogueDataset, list[Dialogue], HF hidden states)
    - Works with both single probes and probe dictionaries
 
-4. **Extensibility**
-   - Abstract base classes for datasets and probes
+5. **Extensibility**
+   - Abstract base classes for datasets, probes, and masks
    - Plugin architecture for new model support
    - Configurable aggregation and transformation
    - Custom metrics via string identifiers
@@ -305,8 +361,12 @@ probelib/
        sequence_aggregation="mean"  # Or score_aggregation for token-level
    )
 
-   # Train
-   train_probes(probe, model, tokenizer, dataset, dataset.labels)
+   # Train with mask to control detection
+   train_probes(
+       probe, model, tokenizer, dataset,
+       labels=dataset.labels,
+       mask=pl.masks.assistant()  # Only detect on assistant messages
+   )
    ```
 
 2. **Multi-Layer Analysis**
@@ -317,14 +377,20 @@ probelib/
        f"layer_{i}": pl.probes.Logistic(layer=i, sequence_aggregation="mean")
        for i in range(model.config.num_hidden_layers)
    }
-   pl.scripts.train_probes(probes, model, tokenizer, dataset, dataset.labels)
+   pl.scripts.train_probes(
+       probes, model, tokenizer, dataset,
+       labels=dataset.labels,
+       mask=pl.masks.assistant()
+   )
    ```
 
 3. **Streaming for Large Datasets**
    ```python
    # Streaming mode for memory efficiency
    pl.scripts.train_probes(
-       probe, model, tokenizer, large_dataset, labels,
+       probe, model, tokenizer, large_dataset,
+       labels=labels,
+       mask=pl.masks.assistant(),
        streaming=True,  # Returns ActivationIterator
        batch_size=8
    )
@@ -337,12 +403,94 @@ probelib/
 
    # Evaluate with custom metrics
    predictions, metrics = evaluate_probes(
-       probe, model, tokenizer, test_data, test_labels,
+       probe, model, tokenizer, test_data,
+       labels=test_labels,
+       mask=pl.masks.assistant(),
        metrics=[
            "auroc",
            "balanced_accuracy",
            functools.partial(pl.metrics.recall_at_fpr, fpr=0.01)
        ]
+   )
+   ```
+
+5. **Using Masks for Fine-Grained Control**
+   ```python
+   # Only detect on last assistant message
+   mask = pl.masks.AndMask(
+       pl.masks.assistant(),
+       pl.masks.nth_message(-1)  # Last message
+   )
+
+   acts = pl.collect_activations(
+       data=dataset,
+       model=model,
+       tokenizer=tokenizer,
+       layers=[16],
+       mask=mask
+   )
+   ```
+
+6. **Integration with External Frameworks (inspect_ai/control-arena)**
+   ```python
+   # Receive data from external framework
+   hidden_states = message.metadata["hidden_states"]  # HF nested tuple format
+   messages = state.messages  # ChatMessage objects
+
+   # Convert to probelib format
+   dialogue = pl.integrations.dialogue_from_inspect_messages(messages)
+
+   # Create activations from hidden states
+   acts = pl.Activations.from_hidden_states(
+       hidden_states,
+       layer_indices=[16]
+   )
+
+   # Run probe inference
+   suspicion_score = probe.predict_proba(acts)[0, 1]
+   ```
+
+7. **Manual Activation Manipulation**
+   ```python
+   # Collect activations
+   acts = pl.collect_activations(
+       data=dataset,
+       model=model,
+       tokenizer=tokenizer,
+       layers=[8, 16, 24],
+       mask=pl.masks.assistant()
+   )
+
+   # Select specific layer
+   layer_16 = acts.select(layers=16)  # Removes LAYER axis
+
+   # Pool over sequence
+   pooled = acts.pool(dim="sequence", method="mean")  # [layers, batch, hidden]
+
+   # Select multiple layers
+   mid_layers = acts.select(layers=[8, 16])  # Keeps LAYER axis
+   ```
+
+8. **Using Different Hook Points**
+   ```python
+   # Extract activations before layernorm (earlier in computation)
+   acts_pre = pl.collect_activations(
+       data=dataset,
+       model=model,
+       tokenizer=tokenizer,
+       layers=[16],
+       mask=pl.masks.assistant(),
+       hook_point="pre_layernorm"
+   )
+
+   # Extract activations after block (default, post-layernorm)
+   acts_post = pl.collect_activations(
+       data=dataset,
+       model=model,
+       tokenizer=tokenizer,
+       layers=[16],
+       mask=pl.masks.assistant(),
+       hook_point="post_block"
    )
    ```
 
@@ -423,7 +571,8 @@ probelib/
    - Check model family in tokenizer.name_or_path
    - Verify padding configuration
    - Ensure consistent chat templates
-   - Test with show_detection_mask_in_html
+   - Test with `visualize_mask()` to see detection masks
+   - Use appropriate mask functions to control detection
 
 3. **Poor Probe Performance**
 
@@ -465,16 +614,53 @@ Located in `pyproject.toml`:
 
 ### Recent Updates & Future Enhancements
 
-**Recently Added:**
+**Recently Added (Latest):**
+- **Unified API changes** (Breaking changes, no backward compatibility):
+  - `Activations.pool()`: Unified method replacing `aggregate()` and `sequence_pool()`
+  - `Activations.select()`: Unified method replacing `select_layer()` and `select_layers()`
+  - `Activations.from_hidden_states()`: Create Activations from HuggingFace nested tuple format
+  - Removed all deprecated methods for cleaner API surface
+  - Improved error messages with actionable hints
+- **Mask system**: Comprehensive composable mask functions for selective token processing
+  - Role masks (assistant, user, system)
+  - Position masks (between, after, before, nth_message)
+  - Text masks (contains, regex)
+  - Composite masks (AndMask, OrMask, NotMask)
+- **Integration utilities**:
+  - `integrations` module for external framework compatibility
+  - `dialogue_from_inspect_messages()` and `dialogue_to_inspect_messages()`
+  - Seamless integration with inspect_ai and control-arena
 - Function-based metrics API with bootstrap confidence intervals
-- Unified aggregation API (sequence vs score aggregation)
 - Streaming support with `ActivationIterator`
 - Multi-probe parallel training with shared activations
 - Attention probe implementation
 - Extensive Cadenza dataset collection
+
+**Removed (Breaking Changes):**
+- `Activations.aggregate()` → Use `Activations.pool(dim="sequence")` instead
+- `Activations.sequence_pool()` → Use `Activations.pool(dim="sequence")` instead
+- `Activations.select_layer()` → Use `Activations.select(layers=...)` instead
+- `Activations.select_layers()` → Use `Activations.select(layers=[...])` instead
+- `Activations.from_components()` → Merged into `Activations.from_tensor()` with defaults
+
+**API Migration Guide:**
+```python
+# Old API (removed)
+acts.aggregate(method="mean", use_detection_mask=True)
+acts.sequence_pool(method="mean", use_detection_mask=True)
+acts.select_layer(16)
+acts.select_layers([8, 16, 24])
+
+# New API (current)
+acts.pool(dim="sequence", method="mean", use_detection_mask=True)
+acts.pool(dim="sequence", method="mean", use_detection_mask=True)
+acts.select(layers=16)
+acts.select(layers=[8, 16, 24])
+```
 
 **Future Enhancements:**
 - Multi-layer probe support (currently single layer only)
 - Multi-dataset train/eval (combine datasets for training)
 - Benchmark evaluation functions (standardized evaluation protocols)
 - TorchScript compilation for production inference
+- Additional mask functions (token-level pattern matching, custom predicates)

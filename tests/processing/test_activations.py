@@ -10,6 +10,7 @@ from probelib.datasets.base import DialogueDataset
 from probelib.processing.activations import (
     ActivationIterator,
     Activations,
+    Axis,
     collect_activations,
     get_batches,
     get_hidden_dim,
@@ -296,7 +297,7 @@ class TestActivations:
         detection_mask = torch.ones(8, 16).bool()
         layer_indices = [0, 5, 10, 15]
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=mask,
             input_ids=input_ids,
@@ -321,10 +322,10 @@ class TestActivations:
                 [1, 1, 1, 1, 1, 1, 1, 1],
             ]
         ).float()
-        input_ids = torch.ones(4, 8)
+        input_ids = torch.ones(4, 8, dtype=torch.long)
         detection_mask = torch.ones(4, 8).bool()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=mask,
             input_ids=input_ids,
@@ -341,10 +342,10 @@ class TestActivations:
         """Test moving activations to device."""
         acts = torch.randn(2, 4, 8, 16)
         mask = torch.ones(4, 8)
-        input_ids = torch.ones(4, 8)
+        input_ids = torch.ones(4, 8, dtype=torch.long)
         detection_mask = torch.ones(4, 8).bool()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=mask,
             input_ids=input_ids,
@@ -359,21 +360,21 @@ class TestActivations:
             assert cuda_acts.activations.device.type == "cuda"
             assert cuda_acts.attention_mask.device.type == "cuda"
             assert cuda_acts.layer_indices == [0, 1]  # Should be preserved
-            assert cuda_acts.batch_indices == [0, 1, 2, 3]
+            assert cuda_acts.batch_indices.tolist() == [0, 1, 2, 3]
 
         # Test dtype conversion
         float16_acts = activations.to(torch.float16)
         assert float16_acts.activations.dtype == torch.float16
         assert float16_acts.attention_mask.dtype == torch.float32  # Should not change
-        assert float16_acts.batch_indices == [0, 1, 2, 3]
+        assert float16_acts.batch_indices.tolist() == [0, 1, 2, 3]
 
     def test_get_layer_tensor_indices(self):
         """Test mapping layer indices to tensor indices."""
         acts = torch.randn(4, 2, 8, 16)
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=torch.ones(2, 8).bool(),
             layer_indices=[0, 5, 10, 15],
         )
@@ -385,26 +386,26 @@ class TestActivations:
         assert activations.get_layer_tensor_indices([0, 10]) == [0, 2]
 
         # Test error for unavailable layer
-        with pytest.raises(ValueError, match="Requested layer 7 is not available"):
+        with pytest.raises(ValueError, match="Layer 7 is not available"):
             activations.get_layer_tensor_indices(7)
 
-    def test_filter_layers(self):
-        """Test filtering layers."""
+    def test_select_multiple_layers(self):
+        """Test selecting multiple layers."""
         acts = torch.randn(4, 2, 8, 16)
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=torch.ones(2, 8).bool(),
             layer_indices=[0, 5, 10, 15],
         )
 
-        # Filter to subset of layers
-        filtered = activations.filter_layers([5, 15])
-        assert filtered.n_layers == 2
-        assert filtered.layer_indices == [5, 15]
-        assert torch.equal(filtered.activations[0], acts[1])  # layer 5 at index 1
-        assert torch.equal(filtered.activations[1], acts[3])  # layer 15 at index 3
+        # Select subset of layers
+        selected = activations.select(layers=[5, 15])
+        assert selected.n_layers == 2
+        assert selected.layer_indices == [5, 15]
+        assert torch.equal(selected.activations[0], acts[1])  # layer 5 at index 1
+        assert torch.equal(selected.activations[1], acts[3])  # layer 15 at index 3
 
     def test_aggregate_mean(self):
         """Test mean aggregation over sequence dimension."""
@@ -417,21 +418,22 @@ class TestActivations:
             ]
         ).float()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[5],
         )
 
         # Test mean aggregation
-        aggregated = activations.aggregate(method="mean")
-        assert aggregated.shape == (2, 16)
+        pooled = activations.pool(dim="sequence", method="mean")
+        result = pooled.activations.squeeze(0)  # Remove layer dimension
+        assert result.shape == (2, 16)
         # First sample: mean of 4 tokens = 1.0
-        assert torch.allclose(aggregated[0], torch.ones(16))
+        assert torch.allclose(result[0], torch.ones(16))
         # Second sample: mean of 2 tokens = 1.0
-        assert torch.allclose(aggregated[1], torch.ones(16))
+        assert torch.allclose(result[1], torch.ones(16))
 
     def test_aggregate_max(self):
         """Test max aggregation over sequence dimension."""
@@ -446,20 +448,21 @@ class TestActivations:
             ]
         ).float()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Test max aggregation
-        aggregated = activations.aggregate(method="max")
-        assert aggregated.shape == (2, 8)
+        pooled = activations.pool(dim="sequence", method="max")
+        result = pooled.activations.squeeze(0)  # Remove layer dimension
+        assert result.shape == (2, 8)
         # First sample: max over first 3 sequences
         expected_0 = acts[0, 0, 2, :]  # Third sequence has max values
-        assert torch.allclose(aggregated[0], expected_0)
+        assert torch.allclose(result[0], expected_0)
 
     def test_aggregate_last_token(self):
         """Test last_token aggregation."""
@@ -471,93 +474,101 @@ class TestActivations:
             ]
         ).float()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Test last_token aggregation
-        aggregated = activations.aggregate(method="last_token")
-        assert aggregated.shape == (2, 8)
+        pooled = activations.pool(dim="sequence", method="last_token")
+        result = pooled.activations.squeeze(0)  # Remove layer dimension
+        assert result.shape == (2, 8)
         # First sample: token at index 2
-        assert torch.allclose(aggregated[0], acts[0, 0, 2, :])
+        assert torch.allclose(result[0], acts[0, 0, 2, :])
         # Second sample: token at index 4
-        assert torch.allclose(aggregated[1], acts[0, 1, 4, :])
+        assert torch.allclose(result[1], acts[0, 1, 4, :])
 
-    def test_aggregate_requires_single_layer(self):
-        """Test that aggregate raises error for multi-layer."""
+    def test_pool_works_with_multi_layer(self):
+        """Test that pool works with multi-layer activations."""
         acts = torch.randn(2, 2, 8, 16)  # 2 layers
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=torch.ones(2, 8),
             layer_indices=[0, 1],
         )
 
-        with pytest.raises(ValueError, match="Aggregation requires single layer"):
-            activations.aggregate()
+        # Pool should work with multiple layers
+        pooled = activations.pool(dim="sequence", method="mean")
+        # Result should have shape [2 layers, 2 batch, 16 hidden]
+        assert pooled.activations.shape == (2, 2, 16)
+        assert pooled.has_axis(Axis.LAYER)
+        assert not pooled.has_axis(Axis.SEQ)
 
     def test_aggregate_mean_empty_mask(self):
         """Test mean aggregation with completely empty detection mask."""
         acts = torch.randn(1, 2, 8, 16)  # 1 layer, 2 batch, 8 seq, 16 dim
         detection_mask = torch.zeros(2, 8)  # All tokens invalid
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Mean aggregation should handle empty masks gracefully
-        aggregated = activations.aggregate(method="mean")
-        assert aggregated.shape == (2, 16)
+        pooled = activations.pool(dim="sequence", method="mean")
+        result = pooled.activations.squeeze(0)  # Remove layer dimension
+        assert result.shape == (2, 16)
         # With no valid tokens, result should be zeros (sum=0, count clamped to 1)
-        assert torch.allclose(aggregated, torch.zeros(2, 16))
+        assert torch.allclose(result, torch.zeros(2, 16))
 
     def test_aggregate_max_empty_mask(self):
         """Test max aggregation with completely empty detection mask."""
         acts = torch.randn(1, 2, 8, 16)  # 1 layer, 2 batch, 8 seq, 16 dim
         detection_mask = torch.zeros(2, 8)  # All tokens invalid
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Max aggregation should handle empty masks gracefully
-        aggregated = activations.aggregate(method="max")
-        assert aggregated.shape == (2, 16)
+        pooled = activations.pool(dim="sequence", method="max")
+        result = pooled.activations.squeeze(0)  # Remove layer dimension
+        assert result.shape == (2, 16)
         # With no valid tokens, result should be zeros (not -inf)
-        assert torch.allclose(aggregated, torch.zeros(2, 16))
-        assert not torch.any(torch.isinf(aggregated))  # No infinities
+        assert torch.allclose(result, torch.zeros(2, 16))
+        assert not torch.any(torch.isinf(result))  # No infinities
 
     def test_aggregate_last_token_empty_mask(self):
         """Test last_token aggregation with completely empty detection mask."""
         acts = torch.randn(1, 2, 8, 16)  # 1 layer, 2 batch, 8 seq, 16 dim
         detection_mask = torch.zeros(2, 8)  # All tokens invalid
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Last token aggregation should handle empty masks gracefully
-        aggregated = activations.aggregate(method="last_token")
-        assert aggregated.shape == (2, 16)
+        pooled = activations.pool(dim="sequence", method="last_token")
+        result = pooled.activations.squeeze(0)  # Remove layer dimension
+        assert result.shape == (2, 16)
         # With no valid tokens, result should be zeros
-        assert torch.allclose(aggregated, torch.zeros(2, 16))
+        assert torch.allclose(result, torch.zeros(2, 16))
 
     def test_aggregate_mixed_empty_masks(self):
         """Test aggregation with some batches having empty masks."""
@@ -570,22 +581,23 @@ class TestActivations:
             ]
         ).float()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(3, 8),
-            input_ids=torch.ones(3, 8),
+            input_ids=torch.ones(3, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Test all aggregation methods with mixed masks
         for method in ["mean", "max", "last_token"]:
-            aggregated = activations.aggregate(method=method)
-            assert aggregated.shape == (3, 16)
+            pooled = activations.pool(dim="sequence", method=method)
+            result = pooled.activations.squeeze(0)  # Remove layer dimension
+            assert result.shape == (3, 16)
             # Second batch (index 1) should be zeros
-            assert torch.allclose(aggregated[1], torch.zeros(16))
+            assert torch.allclose(result[1], torch.zeros(16))
             # Other batches should have non-zero values (unless acts happen to be zero)
-            assert not torch.any(torch.isinf(aggregated))  # No infinities
+            assert not torch.any(torch.isinf(result))  # No infinities
 
     def test_to_token_level(self):
         """Test token-level feature extraction."""
@@ -597,16 +609,16 @@ class TestActivations:
             ]
         ).float()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Extract token-level features
-        features, tokens_per_sample = activations.to_token_level()
+        features, tokens_per_sample = activations.extract_tokens()
 
         # Should have 5 total tokens (3 + 2)
         assert features.shape == (5, 8)
@@ -624,32 +636,32 @@ class TestActivations:
     def test_to_token_level_requires_single_layer(self):
         """Test that to_token_level raises error for multi-layer."""
         acts = torch.randn(2, 2, 8, 16)  # 2 layers
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=torch.ones(2, 8),
             layer_indices=[0, 1],
         )
 
         with pytest.raises(ValueError, match="Token extraction requires single layer"):
-            activations.to_token_level()
+            activations.extract_tokens()
 
     def test_to_token_level_empty_mask(self):
         """Test token-level extraction with completely empty detection mask."""
         acts = torch.randn(1, 2, 8, 16)  # 1 layer, 2 batch, 8 seq, 16 dim
         detection_mask = torch.zeros(2, 8)  # All tokens invalid
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(2, 8),
-            input_ids=torch.ones(2, 8),
+            input_ids=torch.ones(2, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Should return empty features
-        features, tokens_per_sample = activations.to_token_level()
+        features, tokens_per_sample = activations.extract_tokens()
         assert features.shape == (0, 16)  # No valid tokens
         assert tokens_per_sample.tolist() == [0, 0]
 
@@ -664,16 +676,16 @@ class TestActivations:
             ]
         ).float()
 
-        activations = Activations(
+        activations = Activations.from_components(
             activations=acts,
             attention_mask=torch.ones(3, 8),
-            input_ids=torch.ones(3, 8),
+            input_ids=torch.ones(3, 8, dtype=torch.long),
             detection_mask=detection_mask,
             layer_indices=[0],
         )
 
         # Should handle mixed masks properly
-        features, tokens_per_sample = activations.to_token_level()
+        features, tokens_per_sample = activations.extract_tokens()
         assert features.shape == (3, 8)  # 2 + 0 + 1 = 3 valid tokens
         assert tokens_per_sample.tolist() == [2, 0, 1]
 

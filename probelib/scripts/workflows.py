@@ -383,8 +383,9 @@ def _evaluate_probes_streaming(
 
     # Initialize prediction storage that preserves original order
     n_samples = len(labels)
+    # Use float32 for predictions to ensure compatibility
     probe_predictions = {
-        name: torch.zeros(n_samples, device=labels.device) for name in probes
+        name: torch.zeros(n_samples, device=labels.device, dtype=torch.float32) for name in probes
     }
     labels_seen = set()
 
@@ -414,9 +415,10 @@ def _evaluate_probes_streaming(
             probs = probe.predict_proba(batch_activations)
             # Get positive class probabilities and store in correct positions
             preds = probs[:, 1]
-            # Ensure preds is on the same device as probe_predictions
+            # Ensure preds is on the same device and dtype as probe_predictions
             if isinstance(preds, torch.Tensor):
-                preds = preds.to(probe_predictions[name].device)
+                # Convert to float32 for consistency
+                preds = preds.to(device=probe_predictions[name].device, dtype=torch.float32)
             probe_predictions[name][batch_indices] = preds
 
     # Verify we saw all samples

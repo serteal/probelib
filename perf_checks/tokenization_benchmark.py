@@ -11,9 +11,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import AutoTokenizer
+from utils import TimingResult, measure_with_warmup
 
 import probelib as pl
-from benchmarks.utils import TimingResult, measure_with_warmup
 from probelib.masks import (
     after,
     all,

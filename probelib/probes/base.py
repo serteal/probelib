@@ -73,12 +73,12 @@ class BaseProbe(ABC):
         # Handle layer selection if specified
         if self.layer is not None:
             if acts.has_axis(Axis.LAYER):
-                acts = acts.select_layer(self.layer)
+                acts = acts.select(layers=self.layer)
         elif acts.has_axis(Axis.LAYER):
             if acts.n_layers != 1:
                 raise ValueError(
                     f"Probe expects single layer but got {acts.n_layers} layers. "
-                    f"Use select_layer() or set layer parameter."
+                    f"Use select(layers=i) or set layer parameter."
                 )
             # Single layer - will be squeezed below
 
@@ -99,7 +99,7 @@ class BaseProbe(ABC):
             # Sequence-level: pool sequences based on method
             if acts.has_axis(Axis.SEQ):
                 pooling_method = self.sequence_pooling.value  # Get string value
-                acts = acts.sequence_pool(method=pooling_method, use_detection_mask=True)
+                acts = acts.pool(dim="sequence", method=pooling_method, use_detection_mask=True)
                 if self.verbose:
                     print(f"Pooled sequences using {pooling_method}")
 

@@ -5,9 +5,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from utils import TimingResult, measure_with_warmup, timer
 
 import probelib as pl
-from benchmarks.utils import TimingResult, measure_with_warmup, timer
 
 torch.set_float32_matmul_precision("high")
 pl.logger.logger.setLevel(logging.WARNING)  # type: ignore

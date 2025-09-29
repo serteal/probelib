@@ -259,12 +259,32 @@ def tokenize_dialogues(
         for d in dialogue_dicts
     ]
 
-    # Apply chat template
-    formatted_dialogues = tokenizer.apply_chat_template(
-        dialogue_dicts,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-    )
+    # Apply chat template if available, otherwise use simple formatting
+    if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
+        formatted_dialogues = tokenizer.apply_chat_template(
+            dialogue_dicts,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+    else:
+        # Fallback for models without chat templates (e.g., LLAMA-2)
+        # For simple single-turn dialogues, just use the content directly
+        formatted_dialogues = []
+        for dialogue_dict in dialogue_dicts:
+            if len(dialogue_dict) == 1 and dialogue_dict[0]["role"] == "user":
+                # Single user message - just use the content
+                formatted_dialogues.append(dialogue_dict[0]["content"])
+            else:
+                # Multi-turn dialogue - format as simple text
+                formatted = ""
+                for msg in dialogue_dict:
+                    if msg["role"] == "system":
+                        formatted += f"System: {msg['content']}\n\n"
+                    elif msg["role"] == "user":
+                        formatted += f"User: {msg['content']}\n\n"
+                    elif msg["role"] == "assistant":
+                        formatted += f"Assistant: {msg['content']}\n\n"
+                formatted_dialogues.append(formatted.strip())
 
     default_tokenize_kwargs: dict[str, Any] = {
         "return_tensors": "pt",

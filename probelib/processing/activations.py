@@ -352,34 +352,159 @@ class Activations:
         )
 
     @classmethod
+    def from_hidden_states(
+        cls,
+        hidden_states: tuple[tuple[torch.Tensor, ...], ...] | torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        detection_mask: torch.Tensor | None = None,
+        layer_indices: list[int] | None = None,
+        batch_indices: torch.Tensor | None = None,
+    ) -> "Activations":
+        """Create Activations from pre-extracted hidden states.
+
+        This is designed for integration with external libraries (like inspect_ai or
+        control-arena) that return hidden states from model calls. It handles both
+        the nested tuple format from HuggingFace and pre-stacked tensors.
+
+        Args:
+            hidden_states: Hidden states in one of two formats:
+                - HuggingFace format: tuple[tuple[Tensor, ...], ...] where outer tuple
+                  is generation steps, inner tuple is layers. Each tensor is [batch, seq, hidden].
+                  Example: ((layer0_step0, layer1_step0), (layer0_step1, layer1_step1))
+                - Stacked format: Tensor of shape [layer, batch, seq, hidden]
+            input_ids: Token IDs [batch, seq] (optional, defaults to ones)
+            attention_mask: Attention mask [batch, seq] (optional, defaults to ones)
+            detection_mask: Detection mask [batch, seq] (optional, defaults to ones)
+            layer_indices: Which layers these are from (optional, inferred as 0..N-1)
+            batch_indices: Batch indices for streaming (optional)
+
+        Returns:
+            Activations object ready for probe inference
+
+        Examples:
+            # From inspect_ai metadata (nested tuples)
+            >>> message = state.messages[-1]  # ChatMessageAssistant
+            >>> hidden_states = message.metadata["hidden_states"]
+            >>> acts = Activations.from_hidden_states(
+            ...     hidden_states,
+            ...     input_ids=tokenized["input_ids"],
+            ...     attention_mask=tokenized["attention_mask"]
+            ... )
+
+            # From pre-stacked tensor
+            >>> stacked = torch.randn(32, 1, 128, 4096)  # [layers, batch, seq, hidden]
+            >>> acts = Activations.from_hidden_states(stacked)
+
+        Raises:
+            ValueError: If hidden_states format is invalid or empty
+            TypeError: If hidden_states is not tuple or Tensor
+        """
+        # Handle nested tuple format (HuggingFace)
+        if isinstance(hidden_states, tuple):
+            # hidden_states: tuple of tuples
+            # Outer tuple = generation steps (one per generated token)
+            # Inner tuple = layers (one per model layer)
+            # Each tensor = [batch, 1, hidden] for single token generation
+
+            num_steps = len(hidden_states)
+            if num_steps == 0:
+                raise ValueError("Empty hidden_states tuple")
+
+            num_layers = len(hidden_states[0])
+            if num_layers == 0:
+                raise ValueError("Empty layer tuple in hidden_states")
+
+            # Verify all steps have same number of layers
+            for step_idx, step_tuple in enumerate(hidden_states):
+                if len(step_tuple) != num_layers:
+                    raise ValueError(
+                        f"Inconsistent layer count: step 0 has {num_layers} layers, "
+                        f"step {step_idx} has {len(step_tuple)} layers"
+                    )
+
+            # Collect all tensors per layer across steps
+            layer_tensors = []
+            for layer_idx in range(num_layers):
+                # Get all tensors for this layer across generation steps
+                step_tensors = [
+                    hidden_states[step_idx][layer_idx] for step_idx in range(num_steps)
+                ]
+
+                # Each step_tensor is [batch, 1, hidden] for single-token generation
+                # or [batch, seq_len, hidden] for multi-token
+                # Concatenate along sequence dimension
+                layer_tensor = torch.cat(step_tensors, dim=1)  # [batch, total_seq, hidden]
+                layer_tensors.append(layer_tensor)
+
+            # Stack layers to get [layer, batch, seq, hidden]
+            activations_tensor = torch.stack(layer_tensors, dim=0)
+
+        elif isinstance(hidden_states, torch.Tensor):
+            activations_tensor = hidden_states
+            if activations_tensor.ndim != 4:
+                raise ValueError(
+                    f"Expected 4D tensor [layer, batch, seq, hidden], "
+                    f"got shape {activations_tensor.shape}"
+                )
+        else:
+            raise TypeError(
+                f"hidden_states must be tuple or Tensor, got {type(hidden_states)}"
+            )
+
+        # Use existing from_tensor to handle the rest
+        return cls.from_tensor(
+            activations=activations_tensor,
+            layer_indices=layer_indices,
+            attention_mask=attention_mask,
+            detection_mask=detection_mask,
+            input_ids=input_ids,
+            batch_indices=batch_indices,
+        )
+
+    @classmethod
     def from_components(
         cls,
         *,
         activations: torch.Tensor,
-        layer_indices: Iterable[int],
+        layer_indices: Iterable[int] | list[int],
         attention_mask: torch.Tensor,
         detection_mask: torch.Tensor,
         input_ids: torch.Tensor,
         batch_indices: Iterable[int] | torch.Tensor | None = None,
-        axes: tuple[Axis, ...] = _DEFAULT_AXES,
+        axes: tuple[Axis, ...] | None = None,
     ) -> "Activations":
-        layer_meta = LayerMeta(tuple(int(i) for i in layer_indices))
-        sequence_meta = SequenceMeta(
+        """Create Activations from explicit components.
+
+        This is an alias for from_tensor() with all parameters explicitly provided.
+        It exists for backward compatibility and explicitness when you have all
+        components ready.
+
+        Args:
+            activations: Activation tensor (should be 4D: [layer, batch, seq, hidden])
+            layer_indices: Layer indices for the activations
+            attention_mask: Attention mask [batch, seq]
+            detection_mask: Detection mask [batch, seq]
+            input_ids: Input IDs [batch, seq]
+            batch_indices: Optional batch indices for streaming
+            axes: Optional custom axes (defaults to standard ordering)
+
+        Returns:
+            Activations object
+        """
+        # Convert to list if needed
+        if not isinstance(layer_indices, list):
+            layer_indices = list(layer_indices)
+
+        # Use from_tensor which handles all the logic
+        return cls.from_tensor(
+            activations=activations,
+            layer_indices=layer_indices,
             attention_mask=attention_mask,
             detection_mask=detection_mask,
             input_ids=input_ids,
-        )
-        batch_tensor = (
-            torch.as_tensor(batch_indices, dtype=torch.long)
-            if batch_indices is not None
-            else None
-        )
-        return cls(
-            activations=activations,
-            axes=axes,
-            layer_meta=layer_meta,
-            sequence_meta=sequence_meta,
-            batch_indices=batch_tensor,
+            batch_indices=batch_indices,
         )
 
     # ------------------------------------------------------------------
@@ -469,8 +594,14 @@ class Activations:
     def expect_axes(self, *axes: Axis) -> None:
         missing = tuple(axis for axis in axes if axis not in self._axis_positions)
         if missing:
-            names = ", ".join(axis.name for axis in missing)
-            raise ValueError(f"Expected axes {names} to be present; got {self.axes}")
+            missing_names = ", ".join(axis.name for axis in missing)
+            present_names = ", ".join(axis.name for axis in self.axes)
+            raise ValueError(
+                f"Expected axes [{missing_names}] to be present, but they are missing.\n"
+                f"Current axes: [{present_names}]\n"
+                f"Hint: Axes may have been removed by pooling (e.g., pool(dim='sequence')) "
+                f"or layer selection (e.g., select(layers=10))."
+            )
 
     def get_layer_tensor_indices(self, requested_layers: int | list[int]) -> list[int]:
         """
@@ -498,19 +629,28 @@ class Activations:
             except ValueError as exc:
                 available_layers = ", ".join(map(str, layer_indices))
                 raise ValueError(
-                    f"Layer {layer} unavailable. Present layers: [{available_layers}]"
+                    f"Layer {layer} is not available in this Activations object.\n"
+                    f"Available layers: [{available_layers}]\n"
+                    f"Hint: Use acts.select(layers={list(layer_indices)}) to select "
+                    f"available layers, or collect_activations with the desired layers."
                 ) from exc
         return tensor_indices
 
     def _require_layer_meta(self) -> LayerMeta:
         if self.layer_meta is None:
-            raise ValueError("Layer metadata is unavailable; layer axis was reduced")
+            raise ValueError(
+                "Layer metadata is unavailable because the layer axis was removed.\n"
+                "Hint: This happens after pooling over layers (e.g., acts.pool(dim='layer')) "
+                "or selecting a single layer (e.g., acts.select(layers=10))."
+            )
         return self.layer_meta
 
     def _require_sequence_meta(self) -> SequenceMeta:
         if self.sequence_meta is None:
             raise ValueError(
-                "Sequence metadata is unavailable; sequence axis was reduced"
+                "Sequence metadata is unavailable because the sequence axis was removed.\n"
+                "Hint: This happens after pooling over sequences (e.g., acts.pool(dim='sequence')). "
+                "If you need token-level data, use acts.extract_tokens() before pooling."
             )
         return self.sequence_meta
 
@@ -549,43 +689,75 @@ class Activations:
     # Axis transforms
     # ------------------------------------------------------------------
 
-    def select_layer(self, layer: int) -> "Activations":
+    def select(
+        self,
+        *,
+        layers: int | list[int] | range | None = None,
+    ) -> "Activations":
         """
-        Select a single layer, removing the LAYER axis.
+        Unified method for selecting layers with automatic axis handling.
+
+        This is a cleaner API that replaces `select_layer()` and `select_layers()`
+        with a single method that automatically determines whether to keep or
+        remove the layer axis based on input.
 
         Args:
-            layer: Layer index to select
-
-        Returns:
-            New Activations without LAYER axis
-        """
-        self.expect_axes(Axis.LAYER)
-        tensor_idx = self.get_layer_tensor_indices([layer])[0]
-        dim = self._axis_positions[Axis.LAYER]
-        selected = self.activations.select(dim, tensor_idx)
-
-        new_axes = tuple(ax for ax in self.axes if ax != Axis.LAYER)
-        return Activations(
-            activations=selected,
-            axes=new_axes,
-            layer_meta=None,
-            sequence_meta=self.sequence_meta,
-            batch_indices=self.batch_indices,
-        )
-
-    def select_layers(self, layers: list[int]) -> "Activations":
-        """
-        Select multiple layers, keeping the LAYER axis.
-
-        Args:
-            layers: List of layer indices to select
+            layers: Layer(s) to select:
+                - int: Select single layer, remove LAYER axis
+                - list[int]: Select multiple layers, keep LAYER axis
+                - range: Select range of layers, keep LAYER axis
+                - None: No layer selection (returns self)
 
         Returns:
             New Activations with selected layers
+
+        Examples:
+            # Select single layer (removes layer axis)
+            >>> acts.select(layers=10)
+
+            # Select multiple layers (keeps layer axis)
+            >>> acts.select(layers=[10, 15, 20])
+
+            # Select range of layers
+            >>> acts.select(layers=range(10, 20))
+
+        Raises:
+            ValueError: If requested layers are not available
+
+        Note:
+            For backwards compatibility, `select_layer(i)` and
+            `select_layers([i, j])` are still available.
         """
+        if layers is None:
+            return self
+
+        # Ensure we have layer axis
         self.expect_axes(Axis.LAYER)
+
+        # Handle range objects
+        if isinstance(layers, range):
+            layers = list(layers)
+
+        # Single layer - remove axis
+        if isinstance(layers, int):
+            tensor_idx = self.get_layer_tensor_indices([layers])[0]
+            dim = self._axis_positions[Axis.LAYER]
+            selected = self.activations.select(dim, tensor_idx)
+
+            new_axes = tuple(ax for ax in self.axes if ax != Axis.LAYER)
+            return Activations(
+                activations=selected,
+                axes=new_axes,
+                layer_meta=None,
+                sequence_meta=self.sequence_meta,
+                batch_indices=self.batch_indices,
+            )
+
+        # Multiple layers - keep axis
         if not layers:
-            raise ValueError("layers must be non-empty")
+            raise ValueError(
+                f"layers must be non-empty. Available layers: {self.layer_indices}"
+            )
 
         tensor_indices = self.get_layer_tensor_indices(layers)
         dim = self._axis_positions[Axis.LAYER]
@@ -603,48 +775,115 @@ class Activations:
             batch_indices=self.batch_indices,
         )
 
-    def sequence_pool(
+    def pool(
         self,
+        dim: Literal["sequence", "seq", "layer"] = "sequence",
         method: Literal["mean", "max", "last_token"] = "mean",
         use_detection_mask: bool = True,
     ) -> "Activations":
         """
-        Pool over the sequence dimension, removing SEQ axis.
+        Pool over a specified dimension, removing that axis.
+
+        This is a unified API for dimension reduction that works across different axes.
+        Replaces the older `sequence_pool()` and `aggregate()` methods with a more
+        consistent interface.
 
         Args:
-            method: Pooling method to use
-            use_detection_mask: If True, only pool over detected tokens (default)
-                               If False, pool over all tokens
+            dim: Dimension to pool over. Options:
+                - "sequence" or "seq": Pool over sequence dimension
+                - "layer": Pool over layer dimension
+            method: Pooling method to use:
+                - "mean": Average pooling
+                - "max": Max pooling
+                - "last_token": Use last valid token (sequence dim only)
+            use_detection_mask: If True, only pool over detected tokens (default).
+                               Only applies to sequence dimension.
 
         Returns:
-            New Activations without SEQ axis
+            New Activations without the pooled dimension
+
+        Examples:
+            # Pool over sequence dimension (most common)
+            >>> pooled = acts.pool(dim="sequence", method="mean")
+
+            # Pool over layer dimension to get layer-averaged features
+            >>> pooled = acts.pool(dim="layer", method="mean")
+
+            # Pool without detection mask (use all tokens)
+            >>> pooled = acts.pool(dim="sequence", use_detection_mask=False)
+
+        Note:
+            For backwards compatibility, `sequence_pool()` and `aggregate()` are
+            still available but may be deprecated in future versions.
         """
-        self.expect_axes(Axis.SEQ)
-
-        if use_detection_mask:
-            # Use existing _reduce_sequence which respects detection mask
-            reduced = self._reduce_sequence(method)
+        # Normalize dimension name
+        if dim in ("sequence", "seq"):
+            axis = Axis.SEQ
+            self.expect_axes(Axis.SEQ)
+        elif dim == "layer":
+            axis = Axis.LAYER
+            self.expect_axes(Axis.LAYER)
         else:
-            # Simple pooling over all tokens
-            dim = self._axis_positions[Axis.SEQ]
-            if method == "mean":
-                reduced = self.activations.mean(dim=dim)
-            elif method == "max":
-                reduced = self.activations.max(dim=dim).values
-            elif method == "last_token":
-                # Take the last token (index -1) for each sequence
-                reduced = self.activations.select(dim, -1)
-            else:
-                raise ValueError(f"Unknown pooling method: {method}")
+            raise ValueError(
+                f"Unknown dimension: {dim}. Supported: 'sequence', 'seq', 'layer'"
+            )
 
-        new_axes = tuple(ax for ax in self.axes if ax != Axis.SEQ)
-        return Activations(
-            activations=reduced,
-            axes=new_axes,
-            layer_meta=self.layer_meta,
-            sequence_meta=None,
-            batch_indices=self.batch_indices,
-        )
+        # Handle sequence pooling
+        if axis == Axis.SEQ:
+            if use_detection_mask:
+                # Use existing _reduce_sequence which respects detection mask
+                reduced = self._reduce_sequence(method)
+            else:
+                # Simple pooling over all tokens
+                dim_idx = self._axis_positions[Axis.SEQ]
+                if method == "mean":
+                    reduced = self.activations.mean(dim=dim_idx)
+                elif method == "max":
+                    reduced = self.activations.max(dim=dim_idx).values
+                elif method == "last_token":
+                    # Take the last token (index -1) for each sequence
+                    reduced = self.activations.select(dim_idx, -1)
+                else:
+                    raise ValueError(
+                        f"Unknown pooling method: {method}. "
+                        f"Supported: 'mean', 'max', 'last_token'"
+                    )
+
+            new_axes = tuple(ax for ax in self.axes if ax != Axis.SEQ)
+            return Activations(
+                activations=reduced,
+                axes=new_axes,
+                layer_meta=self.layer_meta,
+                sequence_meta=None,
+                batch_indices=self.batch_indices,
+            )
+
+        # Handle layer pooling
+        elif axis == Axis.LAYER:
+            if method == "last_token":
+                raise ValueError(
+                    "'last_token' pooling is only supported for sequence dimension"
+                )
+
+            dim_idx = self._axis_positions[Axis.LAYER]
+            if method == "mean":
+                reduced = self.activations.mean(dim=dim_idx)
+            elif method == "max":
+                reduced = self.activations.max(dim=dim_idx).values
+            else:
+                raise ValueError(
+                    f"Unknown pooling method: {method}. "
+                    f"Supported for layer dimension: 'mean', 'max'"
+                )
+
+            new_axes = tuple(ax for ax in self.axes if ax != Axis.LAYER)
+            return Activations(
+                activations=reduced,
+                axes=new_axes,
+                layer_meta=None,
+                sequence_meta=self.sequence_meta,
+                batch_indices=self.batch_indices,
+            )
 
     def extract_tokens(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -660,7 +899,9 @@ class Activations:
         if self.has_axis(Axis.LAYER):
             if self.n_layers != 1:
                 raise ValueError(
-                    "Token extraction requires single layer. Use select_layer() first."
+                    f"Token extraction requires single layer, but found {self.n_layers} layers.\n"
+                    f"Available layers: {self.layer_indices}\n"
+                    f"Hint: Use acts.select(layers=i) to select a single layer before extracting tokens."
                 )
             # Remove layer dimension
             acts = self.activations.squeeze(self._axis_positions[Axis.LAYER])
@@ -764,16 +1005,6 @@ class Activations:
         return reduced
 
 
-def _coerce_axis(value: Axis | Literal["layer", "sequence"]) -> Axis:
-    if isinstance(value, Axis):
-        return value
-    mapping = {"layer": Axis.LAYER, "sequence": Axis.SEQ}
-    try:
-        return mapping[value]
-    except KeyError as exc:
-        raise ValueError(f"Unknown axis specifier {value!r}") from exc
-
-
 def streaming_activations(
     model: "PreTrainedModel",
     tokenizer: "PreTrainedTokenizerBase",
@@ -781,6 +1012,7 @@ def streaming_activations(
     layers: list[int],
     batch_size: int = 8,
     verbose: bool = False,
+    hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
 ) -> Generator[Activations, None, None]:
     """
     Generator that yields Activations batches with all optimizations preserved.
@@ -800,6 +1032,9 @@ def streaming_activations(
         layers: Layer indices to extract
         batch_size: Batch size for processing
         verbose: Whether to show progress bar
+        hook_point: Where to extract activations:
+            - "post_block": After transformer block (aligns with HF hidden_states)
+            - "pre_layernorm": Before layer normalization (legacy behavior)
 
     Yields:
         Activations objects for each batch
@@ -807,7 +1042,7 @@ def streaming_activations(
     n_samples = tokenized_inputs["input_ids"].shape[0]
 
     # Use HookedModel context for all batches (preserves buffer reuse optimization)
-    with HookedModel(model, layers) as hooked_model:
+    with HookedModel(model, layers, hook_point=hook_point) as hooked_model:
         # Get optimized batches with sorting and views
         batch_iter = get_batches(tokenized_inputs, batch_size, tokenizer)
 
@@ -845,6 +1080,7 @@ def batch_activations(
     layers: list[int],
     batch_size: int = 8,
     verbose: bool = False,
+    hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
 ) -> Activations:
     """
     Collect all activations at once into a single Activations object.
@@ -860,6 +1096,9 @@ def batch_activations(
         layers: Layer indices to extract
         batch_size: Batch size for processing
         verbose: Whether to show progress
+        hook_point: Where to extract activations:
+            - "post_block": After transformer block (aligns with HF hidden_states)
+            - "pre_layernorm": Before layer normalization (legacy behavior)
 
     Returns:
         Single Activations object with all data
@@ -876,7 +1115,7 @@ def batch_activations(
             dtype=model.dtype,
         )
 
-        with HookedModel(model, layers) as hooked_model:
+        with HookedModel(model, layers, hook_point=hook_point) as hooked_model:
             batches = get_batches(tokenized_inputs, batch_size, tokenizer)
 
             if verbose:
@@ -907,7 +1146,7 @@ def batch_activations(
         batch_list = []
         indices_list = []
 
-        with HookedModel(model, layers) as hooked_model:
+        with HookedModel(model, layers, hook_point=hook_point) as hooked_model:
             batches = get_batches(tokenized_inputs, batch_size, tokenizer)
 
             if verbose:
@@ -977,6 +1216,7 @@ class ActivationIterator:
         batch_size: int,
         verbose: bool,
         num_batches: int,
+        hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
     ):
         """
         Initialize the regenerable iterator.
@@ -989,6 +1229,7 @@ class ActivationIterator:
             batch_size: Batch size for processing
             verbose: Whether to show progress
             num_batches: Total number of batches
+            hook_point: Where to extract activations
         """
         self._model = model
         self._tokenizer = tokenizer
@@ -997,6 +1238,7 @@ class ActivationIterator:
         self._batch_size = batch_size
         self._verbose = verbose
         self._num_batches = num_batches
+        self._hook_point = hook_point
 
     def __iter__(self) -> Iterator[Activations]:
         """Create and return a fresh generator for activation batches."""
@@ -1007,6 +1249,7 @@ class ActivationIterator:
             layers=self._layers,
             batch_size=self._batch_size,
             verbose=self._verbose,
+            hook_point=self._hook_point,
         )
 
     def __len__(self) -> int:
@@ -1032,6 +1275,7 @@ def collect_activations(
     add_generation_prompt: bool = False,
     streaming: Literal[False] = False,
     verbose: bool = False,
+    hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
     **tokenize_kwargs: Any,
 ) -> Activations: ...
 
@@ -1049,6 +1293,7 @@ def collect_activations(
     add_generation_prompt: bool = False,
     streaming: Literal[True],
     verbose: bool = False,
+    hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
     **tokenize_kwargs: Any,
 ) -> ActivationIterator: ...
 
@@ -1064,6 +1309,7 @@ def collect_activations(
     add_generation_prompt: bool = False,
     streaming: bool = False,
     verbose: bool = False,
+    hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
     **tokenize_kwargs: Any,
 ) -> Activations | ActivationIterator:
     """Entry point for activation collection across datasets or dialogue lists.
@@ -1088,6 +1334,11 @@ def collect_activations(
             tokenization.
         streaming: When ``True`` yield batches lazily, otherwise load all
             activations into memory.
+        hook_point: Where to extract activations from the model:
+            - "post_block" (default): After transformer block output.
+              Aligns with HuggingFace hidden_states semantics.
+            - "pre_layernorm": Before layer normalization (legacy behavior).
+              Captures pre-normalized representations.
         **tokenize_kwargs: Extra tokenizer arguments.
 
     Returns:
@@ -1140,6 +1391,7 @@ def collect_activations(
             batch_size=batch_size,
             verbose=verbose,
             num_batches=num_batches,
+            hook_point=hook_point,
         )
     else:
         # Collect all activations at once
@@ -1150,4 +1402,5 @@ def collect_activations(
             layers=layers,
             batch_size=batch_size,
             verbose=verbose,
+            hook_point=hook_point,
         )

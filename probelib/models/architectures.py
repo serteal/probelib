@@ -248,12 +248,15 @@ class ArchitectureRegistry:
         elif "gemma" in name_lower:
             return "gemma"
         else:
+            supported = ", ".join(cls._architectures.keys())
             logger.error(
                 "Could not detect architecture from tokenizer name: %s",
                 tokenizer_name,
             )
             raise ValueError(
-                f"Unable to detect architecture for tokenizer '{tokenizer_name}'"
+                f"Unable to detect architecture for tokenizer '{tokenizer_name}'.\n"
+                f"Supported architectures: {supported}\n"
+                f"Hint: Tokenizer name should contain one of: {supported}"
             )
 
     @classmethod
@@ -277,7 +280,14 @@ class ArchitectureRegistry:
             except (AttributeError, IndexError, TypeError):
                 continue
 
+        supported = ", ".join(cls._architectures.keys())
         logger.error(
             f"Unsupported model architecture: {type(base_model)} (original: {type(model)})"
         )
-        raise ValueError(f"Unsupported model architecture: {type(base_model)}")
+        raise ValueError(
+            f"Unsupported model architecture: {type(base_model).__name__}\n"
+            f"Supported architectures: {supported}\n"
+            f"Hint: The model type must be one of: LLaMA-style (LlamaForCausalLM) "
+            f"or Gemma-style (GemmaForCausalLM). "
+            f"If you have a compatible model, please open an issue on GitHub."
+        )
