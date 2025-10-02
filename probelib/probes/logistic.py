@@ -347,6 +347,12 @@ class Logistic(BaseProbe):
         # Create 2-class probability matrix
         probs = torch.stack([1 - probs_positive, probs_positive], dim=-1)
 
+        # Aggregate token predictions to sample predictions if needed
+        if self.sequence_pooling == SequencePooling.NONE and self._tokens_per_sample is not None:
+            probs = self.aggregate_token_predictions(
+                probs, self._tokens_per_sample, method="mean"
+            )
+
         return probs
 
     def save(self, path: Path | str) -> None:

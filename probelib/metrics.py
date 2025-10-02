@@ -167,8 +167,17 @@ def with_bootstrap(
 
             return point_estimate, ci_lower, ci_upper
 
-        wrapped.__name__ = metric_fn.__name__  # type: ignore
-        wrapped.__doc__ = metric_fn.__doc__  # type: ignore
+        # Safely copy attributes (handle both functions and functools.partial)
+        if hasattr(metric_fn, "__name__"):
+            try:
+                wrapped.__name__ = metric_fn.__name__  # type: ignore
+            except AttributeError:
+                # functools.partial doesn't allow __name__ assignment
+                if hasattr(metric_fn, "func"):
+                    wrapped.__name__ = getattr(metric_fn.func, "__name__", "unknown")  # type: ignore
+        if hasattr(metric_fn, "__doc__"):
+            wrapped.__doc__ = metric_fn.__doc__  # type: ignore
+
         wrapped._probelib_bootstrap = True  # type: ignore[attr-defined]
         wrapped._probelib_bootstrap_config = {
             "n_bootstrap": n_bootstrap,
@@ -648,7 +657,7 @@ def get_metric_by_name(name: str) -> Callable:
     # Handle special cases
     if name.startswith(("recall@", "tpr@")):
         fpr_value = float(name.split("@")[1]) / 100
-        return create_recall_at_fpr_metric(fpr_value)
+        return functools.partial(recall_at_fpr, fpr=fpr_value)
 
     elif name.startswith("auroc@"):
         max_fpr = float(name.split("@")[1]) / 100
@@ -656,11 +665,11 @@ def get_metric_by_name(name: str) -> Callable:
 
     elif name.startswith("percentile"):
         q = float(name[10:])  # Extract number after "percentile"
-        return create_percentile_metric(q)
+        return functools.partial(percentile, q=q)
 
     elif name.startswith("fpr@"):
         threshold = float(name.split("@")[1])
-        return create_fpr_at_threshold_metric(threshold)
+        return functools.partial(fpr_at_threshold, threshold=threshold)
 
     else:
         raise ValueError(f"Unknown metric: {name}")

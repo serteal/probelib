@@ -258,6 +258,17 @@ def print_metrics(
         print("No metrics to display.")
         return
 
+    # Check if metrics is a flat dict (single probe) or nested dict (multiple probes)
+    # A flat dict has metric values (floats/tuples), nested has dicts as values
+    is_flat = False
+    if metrics:
+        first_value = next(iter(metrics.values()))
+        # If first value is a number or tuple (not a dict), it's flat
+        if isinstance(first_value, (float, int, tuple)):
+            is_flat = True
+            # Wrap in a dict for uniform handling
+            metrics = {"Metrics": metrics}
+
     # ANSI color codes
     if use_colors:
         RESET = "\033[0m"
@@ -318,11 +329,11 @@ def print_metrics(
         colored_headers = [f"{BOLD}{BRIGHT_WHITE}{h}{RESET}" for h in headers]
         print(tabulate(rows, headers=colored_headers, tablefmt="simple"))
     else:
-        # TODO: Handle case where single probe has no outer level dict
         for probe_name, probe_metrics in metrics.items():
-            # Probe name in cyan and bold
-            print(f"\n{BOLD}{CYAN}{probe_name}{RESET}")
-            print(f"{GRAY}{'─' * (len(probe_name) + 2)}{RESET}")
+            # Only print probe name header if not a flat dict (multiple probes)
+            if not is_flat:
+                print(f"\n{BOLD}{CYAN}{probe_name}{RESET}")
+                print(f"{GRAY}{'─' * (len(probe_name) + 2)}{RESET}")
 
             # Get max metric name length for alignment
             max_name_len = (
