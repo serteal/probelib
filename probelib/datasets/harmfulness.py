@@ -143,7 +143,10 @@ class WildGuardMixDataset(DialogueDataset):
         }
         for d in dataset:
             dialogues.append(
-                [Message(role="user", content=str(d["prompt"]))]
+                [
+                    Message(role="system", content="You are a helpful, honest assistant."),
+                    Message(role="user", content=str(d["prompt"])),
+                ]
             )
             prompt_label = str(d["prompt_harm_label"]).lower()
             labels.append(Label.POSITIVE if prompt_label == "harmful" else Label.NEGATIVE)

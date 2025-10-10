@@ -50,10 +50,6 @@ from probelib import masks
 # Integration utilities for external frameworks
 from probelib import integrations
 from probelib.integrations import dialogue_from_inspect_messages, dialogue_to_inspect_messages
-
-# Benchmarks for systematic evaluation
-from probelib.benchmarks import Benchmark, EvalSpec, TrainSpec, BenchmarkResults
-from probelib.benchmarks import get_benchmark, list_benchmarks
 ```
 
 ## Commands
@@ -149,7 +145,6 @@ uv run python examples/simple_probe_monitor.py         # Complete probe monitori
 uv run python examples/inspect_probe_monitor.py        # Real inspect_ai integration with probe monitors
 uv run python examples/inspect_ai_monitor_example.py   # inspect_ai integration concepts and patterns
 uv run python examples/dolus_chat.py                   # Interactive deception chat demo
-uv run python examples/benchmark_example.py            # Benchmark system demonstration
 ```
 
 ## Architecture Overview
@@ -196,12 +191,6 @@ probelib/
 │   └── composite.py    # Composite masks (AndMask, OrMask, NotMask)
 ├── integrations/        # External framework integration utilities
 │   └── dialogue_conversion.py  # Convert between probelib and external formats
-├── benchmarks/          # Systematic evaluation system
-│   ├── __init__.py     # Public API exports
-│   ├── specs.py        # EvalSpec and TrainSpec dataclasses
-│   ├── results.py      # BenchmarkResults container
-│   ├── core.py         # Benchmark class
-│   └── standard.py     # Standard benchmark definitions and registry
 ├── scripts/             # High-level workflows
 │   └── workflows.py    # train_probes, evaluate_probes
 ├── metrics.py           # Function-based metrics API
@@ -311,22 +300,6 @@ probelib/
     - `dialogue_to_inspect_messages()`: Convert probelib Dialogue → inspect_ai format
     - Enables using probelib probes as monitors/solvers in inspect_ai and control-arena
     - Detection control via mask functions during tokenization (not in dialogue)
-
-11. **Benchmarks (`benchmarks/`)**: Systematic evaluation system
-
-    - **EvalSpec**: Specification for single dataset evaluation (dataset, model, mask, metrics)
-    - **TrainSpec**: Training configuration before evaluation (datasets, model, probe config)
-    - **Benchmark**: Orchestrates training and evaluation with two modes:
-      - Evaluation-only: Pass pre-trained probe to `.run()`
-      - Train-then-eval: Specify training config, train from scratch
-    - **BenchmarkResults**: Container with save/load, DataFrame summary, comparison
-    - **Standard benchmarks**: Registry with `get_benchmark()` and `list_benchmarks()`
-      - `deception_suite`: Multi-dataset deception detection with OOD evaluation
-      - `harmfulness_suite`: Harmfulness detection across multiple datasets
-      - `cross_model_deception`: Test probe generalization across model families
-    - Supports multi-model evaluation (per-dataset model override)
-    - Automatic model loading and memory management
-    - Reproducible configurations with timestamped results
 
 ### Key Design Patterns
 
@@ -521,67 +494,6 @@ probelib/
    )
    ```
 
-9. **Running Benchmarks**
-   ```python
-   from probelib.benchmarks import Benchmark, EvalSpec, TrainSpec, get_benchmark
-
-   # Option 1: Use a standard benchmark
-   benchmark = get_benchmark("deception_suite")
-   results = benchmark.run(
-       probe_class=pl.probes.Logistic,
-       device="cuda",
-       verbose=True
-   )
-   print(results.summary())
-   results.save("experiments/deception_results")
-
-   # Option 2: Create a custom benchmark
-   custom_benchmark = Benchmark(
-       name="Custom Evaluation",
-       default_model="meta-llama/Llama-2-7b-chat-hf",
-       training=TrainSpec(
-           datasets=[
-               pl.datasets.AIAuditDataset(split="train"),
-               pl.datasets.AILiarDataset(split="train")
-           ],
-           mask=pl.masks.assistant(),
-           probe_config={"layer": 16, "sequence_aggregation": "mean"},
-           train_kwargs={"batch_size": 8}
-       ),
-       evaluations=[
-           EvalSpec(
-               dataset=pl.datasets.AIAuditDataset(split="test"),
-               mask=pl.masks.assistant(),
-               metrics=["auroc", "accuracy", "recall@5"],
-               name="AI Audit Test"
-           ),
-           EvalSpec(
-               dataset=pl.datasets.TruthfulQADataset(split="test"),
-               mask=pl.masks.assistant(),
-               metrics=["auroc", "accuracy"],
-               name="TruthfulQA (OOD)"
-           )
-       ]
-   )
-   results = custom_benchmark.run(probe_class=pl.probes.Logistic)
-
-   # Option 3: Evaluate pre-trained probe
-   probe = ...  # Load your trained probe
-   eval_only = Benchmark(
-       name="Evaluation Only",
-       default_model="meta-llama/Llama-2-7b-chat-hf",
-       evaluations=[
-           EvalSpec(dataset=pl.datasets.AIAuditDataset(split="test"))
-       ]
-   )
-   results = eval_only.run(probe=probe)
-
-   # Compare results
-   old_results = pl.benchmarks.BenchmarkResults.load("experiments/previous_run")
-   comparison = results.compare(old_results, metric="auroc")
-   print(comparison)
-   ```
-
 ### Adding New Features
 
 **New Probe Types:**
@@ -749,6 +661,5 @@ acts.select(layers=[8, 16, 24])
 **Future Enhancements:**
 - Multi-layer probe support (currently single layer only)
 - Multi-dataset train/eval (combine datasets for training)
-- Benchmark evaluation functions (standardized evaluation protocols)
 - TorchScript compilation for production inference
 - Additional mask functions (token-level pattern matching, custom predicates)

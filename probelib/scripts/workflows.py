@@ -2,6 +2,8 @@
 Unified high-level workflow functions for training and evaluating probes.
 """
 
+from __future__ import annotations
+
 import functools
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
@@ -9,6 +11,7 @@ import torch
 from jaxtyping import Float, Int
 
 from ..datasets import DialogueDataset
+from ..logger import logger
 from ..metrics import (
     auroc,
     get_metric_by_name,
@@ -17,7 +20,12 @@ from ..metrics import (
 )
 from ..probes import BaseProbe
 from ..processing import collect_activations
-from ..processing.activations import ActivationIterator, Activations
+from ..processing.activations import (
+    ActivationIterator,
+    Activations,
+    RaggedActivations,
+    detect_collection_strategy,
+)
 from ..types import Dialogue, Label
 
 if TYPE_CHECKING:
@@ -30,8 +38,7 @@ if TYPE_CHECKING:
 BaseProbeInput = BaseProbe | Mapping[str, BaseProbe]
 DataInput = DialogueDataset | list[Dialogue]
 PredictionsOutput = (
-    Float[torch.Tensor, "n_examples"]
-    | Mapping[str, Float[torch.Tensor, "n_examples"]]
+    Float[torch.Tensor, "n_examples"] | Mapping[str, Float[torch.Tensor, "n_examples"]]
 )
 MetricsDict = Mapping[str, Any]
 MetricsOutput = MetricsDict | Mapping[str, MetricsDict]
@@ -117,7 +124,20 @@ def train_probes(
     for probe in probes.values():
         all_layers.add(probe.layer)
 
-    # 4. Collect activations once for all layers
+    # 4. Auto-detect optimal collection strategy for memory efficiency
+    collection_strategy = detect_collection_strategy(probes)
+    if verbose and collection_strategy:
+        strategy_names = {
+            "mean": "pooled (mean)",
+            "max": "pooled (max)",
+            "last_token": "pooled (last_token)",
+            "ragged": "ragged",
+        }
+        logger.info(
+            f"Auto-detected collection strategy: {strategy_names.get(collection_strategy, collection_strategy)}"
+        )
+
+    # 5. Collect activations once for all layers
     activations = collect_activations(
         model=model,
         tokenizer=tokenizer,
@@ -127,10 +147,11 @@ def train_probes(
         batch_size=batch_size,
         streaming=streaming,
         verbose=verbose,
+        collection_strategy=collection_strategy,
         **activation_kwargs,
     )
 
-    # 5. Train each probe
+    # 6. Train each probe
     if isinstance(activations, ActivationIterator):
         # Streaming mode
         _train_probes_streaming(probes, activations, labels_tensor)
@@ -277,7 +298,20 @@ def evaluate_probes(
         else:
             all_layers.update(layers)
 
-    # 5. Collect activations (never stream for evaluation)
+    # 5. Auto-detect optimal collection strategy for memory efficiency
+    collection_strategy = detect_collection_strategy(probes)
+    if verbose and collection_strategy:
+        strategy_names = {
+            "mean": "pooled (mean)",
+            "max": "pooled (max)",
+            "last_token": "pooled (last_token)",
+            "ragged": "ragged",
+        }
+        logger.info(
+            f"Auto-detected collection strategy: {strategy_names.get(collection_strategy, collection_strategy)}"
+        )
+
+    # 6. Collect activations
     activations = collect_activations(
         model=model,
         tokenizer=tokenizer,
@@ -287,10 +321,11 @@ def evaluate_probes(
         batch_size=batch_size,
         streaming=streaming,
         verbose=verbose,
+        collection_strategy=collection_strategy,
         **activation_kwargs,
     )
 
-    # 6. Evaluate based on activation type
+    # 7. Evaluate based on activation type
     if isinstance(activations, ActivationIterator):
         # Streaming mode
         all_predictions, all_metrics = _evaluate_probes_streaming(
@@ -314,7 +349,7 @@ def evaluate_probes(
             probes, activations, labels_tensor, metrics, bootstrap_kwargs
         )
 
-    # 7. Return in same format as input
+    # 8. Return in same format as input
     if is_single_probe:
         return all_predictions["_single"], all_metrics["_single"]
     else:
@@ -358,9 +393,8 @@ def _evaluate_probes_batch(
         for metric_fn in metrics:
             metric_name = _metric_display_name(metric_fn)
             metric_callable = metric_fn
-            if (
-                bootstrap_kwargs is not None
-                and not getattr(metric_fn, "_probelib_bootstrap", False)
+            if bootstrap_kwargs is not None and not getattr(
+                metric_fn, "_probelib_bootstrap", False
             ):
                 metric_callable = with_bootstrap(**bootstrap_kwargs)(metric_fn)
 
@@ -386,7 +420,8 @@ def _evaluate_probes_streaming(
     n_samples = len(labels)
     # Use float32 for predictions to ensure compatibility
     probe_predictions = {
-        name: torch.zeros(n_samples, device=labels.device, dtype=torch.float32) for name in probes
+        name: torch.zeros(n_samples, device=labels.device, dtype=torch.float32)
+        for name in probes
     }
     labels_seen = set()
 
@@ -419,7 +454,9 @@ def _evaluate_probes_streaming(
             # Ensure preds is on the same device and dtype as probe_predictions
             if isinstance(preds, torch.Tensor):
                 # Convert to float32 for consistency
-                preds = preds.to(device=probe_predictions[name].device, dtype=torch.float32)
+                preds = preds.to(
+                    device=probe_predictions[name].device, dtype=torch.float32
+                )
             probe_predictions[name][batch_indices] = preds
 
     # Verify we saw all samples
@@ -447,9 +484,8 @@ def _evaluate_probes_streaming(
         for metric_fn in metrics:
             metric_name = _metric_display_name(metric_fn)
             metric_callable = metric_fn
-            if (
-                bootstrap_kwargs is not None
-                and not getattr(metric_fn, "_probelib_bootstrap", False)
+            if bootstrap_kwargs is not None and not getattr(
+                metric_fn, "_probelib_bootstrap", False
             ):
                 metric_callable = with_bootstrap(**bootstrap_kwargs)(metric_fn)
 

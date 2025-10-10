@@ -13,7 +13,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 
-from ..processing.activations import ActivationIterator, Activations, SequencePooling
+from ..processing.activations import (
+    ActivationIterator,
+    Activations,
+    RaggedActivations,
+    SequencePooling,
+)
 from .base import BaseProbe
 
 
@@ -242,34 +247,32 @@ class Attention(BaseProbe):
             fused=self.device.startswith("cuda"),
         )
 
-    def _prepare_features(self, X: Activations) -> tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_features(
+        self, X: Activations | RaggedActivations
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Override to return sequences with their masks instead of aggregating.
-
-        Args:
-            X: Activations object
+        Prepare sequences for attention probe.
 
         Returns:
-            Tuple of (sequences, detection_mask)
-            - sequences: [batch, seq_len, d_model]
-            - detection_mask: [batch, seq_len]
+            tuple[torch.Tensor, torch.Tensor]: (sequences, detection_mask)
         """
-        # Ensure we have the correct layer
+        # Type-based dispatch
+        if isinstance(X, RaggedActivations):
+            # to_padded_batch returns (sequences, mask) where mask is all 1s for detected
+            # Use max_length parameter to prevent memory spikes from very long sequences
+            return X.to_padded_batch(self.layer, max_length=None)
+
+        # Regular Activations (must have sequences)
         if self.layer not in X.layer_indices:
-            raise ValueError(
-                f"Layer {self.layer} not found in activations. Available layers: {X.layer_indices}"
-            )
+            raise ValueError(f"Layer {self.layer} not in activations")
 
-        # Filter to just the layer we need
         if len(X.layer_indices) > 1:
-            X = X.reduce(layer=self.layer)
+            X = X.select(layers=self.layer)
 
-        if X.n_layers != 1:
-            raise ValueError(f"Expected single layer after filtering, got {X.n_layers}")
+        sequences = X.activations.squeeze(0)  # [batch, seq, hidden]
+        detection_mask = X.detection_mask
 
-        # Return sequences and mask (no aggregation)
-        sequences = X.activations.squeeze(0)  # Remove layer dimension
-        return sequences, X.detection_mask
+        return sequences, detection_mask
 
     def fit(self, X: Activations | ActivationIterator, y: list | torch.Tensor) -> "Attention":
         """

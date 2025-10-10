@@ -4,7 +4,12 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 import torch
 
-from ..processing.activations import ActivationIterator, Activations, Axis, SequencePooling
+from ..processing.activations import (
+    ActivationIterator,
+    Activations,
+    Axis,
+    SequencePooling,
+)
 
 
 class BaseProbe(ABC):
@@ -58,63 +63,57 @@ class BaseProbe(ABC):
         self._requires_grad = False  # Set by subclasses if they need gradients
         self._tokens_per_sample = None  # Set when sequence_pooling=NONE
 
-    def _prepare_features(self, acts: Activations) -> torch.Tensor:
-        """
-        Prepare features from activations based on probe configuration.
+    @property
+    def requires_sequences(self) -> bool:
+        """Whether probe needs full sequences."""
+        return self.sequence_pooling == SequencePooling.NONE
 
-        Args:
-            acts: Input activations
+    @property
+    def preferred_pooling(self) -> str | None:
+        """Preferred pooling method for memory efficiency."""
+        if self.sequence_pooling == SequencePooling.NONE:
+            return None
+        return self.sequence_pooling.value
+
+    def _prepare_features(
+        self, acts: Activations
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepare features from Activations (works with all storage formats).
 
         Returns:
-            Prepared feature tensor
+            torch.Tensor: For most probes (features only)
+            tuple[torch.Tensor, torch.Tensor]: For Attention probe (sequences, mask)
+
+        Note: Attention probe overrides this to return (sequences, detection_mask).
+        Base implementation returns features only.
         """
-        # Handle layer selection if specified
+
+        # Regular Activations (dense or pooled)
         if self.layer is not None:
             if acts.has_axis(Axis.LAYER):
                 acts = acts.select(layers=self.layer)
-        elif acts.has_axis(Axis.LAYER):
-            if acts.n_layers != 1:
-                raise ValueError(
-                    f"Probe expects single layer but got {acts.n_layers} layers. "
-                    f"Use select(layers=i) or set layer parameter."
-                )
-            # Single layer - will be squeezed below
+        elif acts.has_axis(Axis.LAYER) and acts.n_layers != 1:
+            raise ValueError(f"Expected single layer, got {acts.n_layers}")
 
-        # Apply sequence pooling
+        # Sequence handling
         if self.sequence_pooling == SequencePooling.NONE:
-            # Token-level: extract tokens and store counts for later aggregation
+            # Token-level training
             if not acts.has_axis(Axis.SEQ):
-                raise ValueError(
-                    "sequence_pooling=NONE requires sequence dimension, "
-                    "but activations are already pooled"
-                )
+                raise ValueError("Token-level training requires sequences")
             features, self._tokens_per_sample = acts.extract_tokens()
-            if self.verbose:
-                n_tokens = features.shape[0]
-                n_samples = len(self._tokens_per_sample)
-                print(f"Token-level: {n_tokens} tokens from {n_samples} samples")
+            return features
         else:
-            # Sequence-level: pool sequences based on method
+            # Sequence-level training
             if acts.has_axis(Axis.SEQ):
-                pooling_method = self.sequence_pooling.value  # Get string value
-                acts = acts.pool(dim="sequence", method=pooling_method, use_detection_mask=True)
-                if self.verbose:
-                    print(f"Pooled sequences using {pooling_method}")
+                acts = acts.pool(dim="sequence", method=self.sequence_pooling.value)
 
-            # Get the activation tensor and squeeze layer dim if present
             features = acts.activations
             if acts.has_axis(Axis.LAYER):
                 features = features.squeeze(acts._axis_positions[Axis.LAYER])
 
-            # Ensure 2D [batch, hidden]
-            if features.ndim != 2:
-                raise ValueError(
-                    f"Expected 2D [batch, hidden] after pooling, got shape {features.shape}"
-                )
-
             self._tokens_per_sample = None
-
-        return features
+            return features
 
     def _prepare_labels(
         self, y: list | torch.Tensor, expand_for_tokens: bool = False
