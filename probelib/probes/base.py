@@ -270,19 +270,23 @@ class BaseProbe(ABC):
     def predict_proba(
         self,
         X: Activations | ActivationIterator,
+        *,
+        logits: bool = False,
     ) -> torch.Tensor:
         """
-        Predict class probabilities.
-
-        Returns predictions at the same granularity as training:
-        - If sequence_pooling=NONE: returns [n_tokens, 2]
-        - Otherwise: returns [n_samples, 2]
+        Predict class probabilities or logits.
 
         Args:
             X: Activations or ActivationIterator containing features
+            logits: If True, return raw logits instead of probabilities.
+                Useful for adversarial training to avoid sigmoid saturation.
 
         Returns:
-            Tensor of probabilities for each class
+            If logits=False (default):
+                - If sequence_pooling=NONE: [n_tokens, 2] probabilities
+                - Otherwise: [n_samples, 2] probabilities
+            If logits=True:
+                - Returns [n_samples,] or [n_tokens,] raw logits
         """
         pass
 

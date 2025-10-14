@@ -23,7 +23,6 @@ from ..processing import collect_activations
 from ..processing.activations import (
     ActivationIterator,
     Activations,
-    RaggedActivations,
     detect_collection_strategy,
 )
 from ..types import Dialogue, Label
@@ -74,18 +73,17 @@ def train_probes(
     probes: BaseProbeInput,
     model: "PreTrainedModel",
     tokenizer: "PreTrainedTokenizerBase",
-    data: DataInput,
+    dataset: DialogueDataset,
     *,
-    labels: list[Label] | Int[torch.Tensor, "n_examples"] | None = None,
     mask: "MaskFunction" | None = None,
     batch_size: int = 32,
-    streaming: bool = True,
+    streaming: bool = False,
     verbose: bool = True,
     **activation_kwargs: Any,
 ) -> None:
     """Train one or many probes while reusing a single activation pass.
 
-    Callers provide the probes plus model/tokenizer/data, and the function caches activations,
+    Callers provide the probes plus model/tokenizer/dataset, and the function caches activations,
     streams when datasets are large, and fans out training to each probe. It is
     intentionally thin so users can compose additional logging/loop logic around
     it without losing the shared caching benefits.
@@ -94,8 +92,8 @@ def train_probes(
         probes: Single probe or mapping name → probe instance.
         model: Language model whose activations are collected.
         tokenizer: Tokenizer aligned with the model.
-        data: Dialogue dataset or list of :class:`Dialogue` objects.
-        labels: Labels as ``Label`` enums or integer tensor.
+        dataset: DialogueDataset containing dialogues and labels.
+        mask: Optional mask function for token selection.
         batch_size: Number of sequences per activation batch.
         streaming: Whether to force streaming activations.
         verbose: Toggle progress reporting.
@@ -106,12 +104,8 @@ def train_probes(
     is_single_probe = isinstance(probes, BaseProbe)
     probes = {"_single": probes} if is_single_probe else probes
 
-    if labels is None:
-        if not isinstance(data, DialogueDataset):
-            raise ValueError("Labels are required when data is not a DialogueDataset")
-        labels = data.labels
-
-    # 2. Convert labels to tensor
+    # 2. Get labels from dataset and convert to tensor
+    labels = dataset.labels
     if isinstance(labels, list) and labels and isinstance(labels[0], Label):
         labels_tensor = torch.tensor([label.value for label in labels])
     else:
@@ -141,7 +135,7 @@ def train_probes(
     activations = collect_activations(
         model=model,
         tokenizer=tokenizer,
-        data=data,
+        dataset=dataset,
         layers=sorted(all_layers),
         mask=mask,  # Pass mask for token selection
         batch_size=batch_size,
@@ -197,9 +191,8 @@ def evaluate_probes(
     probes: BaseProbeInput,
     model: "PreTrainedModel",
     tokenizer: "PreTrainedTokenizerBase",
-    data: DataInput,
+    dataset: DialogueDataset,
     *,
-    labels: list[Label] | Int[torch.Tensor, "n_examples"] | None = None,
     mask: "MaskFunction" | None = None,
     batch_size: int = 32,
     streaming: bool = True,
@@ -212,12 +205,13 @@ def evaluate_probes(
     Unified evaluation function for single or multiple probes.
 
     Args:
-        probe_or_probes: Single BaseProbe or dict mapping names to BaseProbes
+        probes: Single BaseProbe or dict mapping names to BaseProbes
         model: Language model to extract activations from
         tokenizer: Tokenizer for the model
-        data: Either a DialogueDataset or list of Dialogue objects
-        labels: Ground truth labels for evaluation
+        dataset: DialogueDataset containing dialogues and labels
+        mask: Optional mask function for token selection
         batch_size: Batch size for activation collection
+        streaming: Whether to use streaming mode for large datasets
         metrics: List of metric functions or names (defaults to standard set)
         bootstrap: ``None`` (default) disables bootstrap; pass ``True`` to apply
             default bootstrap settings or a dict of keyword arguments accepted by
@@ -232,14 +226,15 @@ def evaluate_probes(
 
     Examples:
         >>> # Single probe
+        >>> dataset = pl.datasets.CircuitBreakersDataset(split="test")
         >>> predictions, metrics = evaluate_probes(
-        ...     probe, model, tokenizer, test_data, test_labels
+        ...     probe, model, tokenizer, dataset
         ... )
         >>> print(f"AUROC: {metrics['auroc']:.3f}")
 
         >>> # Multiple probes
         >>> predictions, metrics = evaluate_probes(
-        ...     probes, model, tokenizer, test_data, test_labels,
+        ...     probes, model, tokenizer, dataset,
         ...     metrics=["auroc", "balanced_accuracy"]
         ... )
         >>> print(f"Early layers AUROC: {metrics['early']['auroc']:.3f}")
@@ -248,12 +243,8 @@ def evaluate_probes(
     is_single_probe = isinstance(probes, BaseProbe)
     probes = {"_single": probes} if is_single_probe else probes
 
-    if labels is None:
-        if not isinstance(data, DialogueDataset):
-            raise ValueError("Labels are required when data is not a DialogueDataset")
-        labels = data.labels
-
-    # 2. Convert labels to tensor
+    # 2. Get labels from dataset and convert to tensor
+    labels = dataset.labels
     if isinstance(labels, list) and labels and isinstance(labels[0], Label):
         labels_tensor = torch.tensor([label.value for label in labels])
         valid_indices = None
@@ -315,7 +306,7 @@ def evaluate_probes(
     activations = collect_activations(
         model=model,
         tokenizer=tokenizer,
-        data=data,
+        dataset=dataset,
         layers=sorted(all_layers),
         mask=mask,  # Pass mask for token selection
         batch_size=batch_size,

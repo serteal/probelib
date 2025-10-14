@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.preprocessing import StandardScaler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from ..processing.activations import ActivationIterator, Activations, SequencePooling
 from .base import BaseProbe
@@ -153,7 +153,13 @@ class Logistic(BaseProbe):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(random_state)
 
-    def _init_network(self, d_model: int, dtype: torch.dtype | None = None, use_lbfgs: bool = True, n_epochs: int = 100):
+    def _init_network(
+        self,
+        d_model: int,
+        dtype: torch.dtype | None = None,
+        use_lbfgs: bool = True,
+        n_epochs: int = 100,
+    ):
         """Initialize the network and optimizer once we know the input dimension."""
         self._d_model = d_model
         self._network = _LogisticNetwork(d_model).to(self.device)
@@ -167,7 +173,7 @@ class Logistic(BaseProbe):
             self._optimizer = torch.optim.LBFGS(
                 self._network.parameters(),
                 max_iter=self.max_iter,
-                line_search_fn='strong_wolfe',
+                line_search_fn="strong_wolfe",
             )
             self._use_lbfgs = True
         else:
@@ -195,14 +201,18 @@ class Logistic(BaseProbe):
             self._scheduler = CosineAnnealingLR(
                 self._optimizer,
                 T_max=n_epochs,  # Full cosine cycle over all epochs
-                eta_min=self._lr * 0.1  # Minimum LR is 10% of base (not too low)
+                eta_min=self._lr * 0.1,  # Minimum LR is 10% of base (not too low)
             )
 
             # Log streaming hyperparameters if verbose
-            if hasattr(self, 'verbose') and self.verbose:
-                print(f"Streaming AdamW initialized: C={self.C}, alpha={self._alpha:.4f}, "
-                      f"lr={self._lr:.6f}, weight_decay={self._alpha:.4f}")
-                print(f"LR schedule: cosine annealing over {n_epochs} epochs (min_lr={self._lr * 0.1:.6f})")
+            if hasattr(self, "verbose") and self.verbose:
+                print(
+                    f"Streaming AdamW initialized: C={self.C}, alpha={self._alpha:.4f}, "
+                    f"lr={self._lr:.6f}, weight_decay={self._alpha:.4f}"
+                )
+                print(
+                    f"LR schedule: cosine annealing over {n_epochs} epochs (min_lr={self._lr * 0.1:.6f})"
+                )
 
     def fit(
         self, X: Activations | ActivationIterator, y: list | torch.Tensor
@@ -224,7 +234,9 @@ class Logistic(BaseProbe):
             labels = self._prepare_labels(y)
 
             if self.verbose:
-                print(f"Streaming mode: training for {n_epochs} epochs with cosine annealing LR")
+                print(
+                    f"Streaming mode: training for {n_epochs} epochs with cosine annealing LR"
+                )
 
             # Track first batch to initialize network with correct n_epochs
             first_batch = True
@@ -247,12 +259,14 @@ class Logistic(BaseProbe):
                 if epoch == 0:
                     self._scaler_frozen = True
                     if self.verbose:
-                        print(f"  Scaler frozen after epoch 1 (mean: {self._scaler.mean_[:3].cpu().numpy()}, std: {self._scaler.std_[:3].cpu().numpy()})")
+                        print(
+                            f"  Scaler frozen after epoch 1 (mean: {self._scaler.mean_[:3].cpu().numpy()}, std: {self._scaler.std_[:3].cpu().numpy()})"
+                        )
 
                 # Step the learning rate scheduler at the end of each epoch
                 if self._scheduler is not None:
                     self._scheduler.step()
-                    current_lr = self._optimizer.param_groups[0]['lr']
+                    current_lr = self._optimizer.param_groups[0]["lr"]
                     if self.verbose and (epoch + 1) % 10 == 0:
                         print(f"  Epoch {epoch + 1}/{n_epochs}: lr={current_lr:.6f}")
                 elif self.verbose and (epoch + 1) % 10 == 0:
@@ -305,8 +319,8 @@ class Logistic(BaseProbe):
             l2_reg = 0.0
             if l2_weight > 0:
                 for name, param in self._network.named_parameters():
-                    if 'weight' in name:  # Only regularize weights, not bias
-                        l2_reg += torch.sum(param ** 2)
+                    if "weight" in name:  # Only regularize weights, not bias
+                        l2_reg += torch.sum(param**2)
 
             loss = bce_loss + l2_weight * l2_reg
             loss.backward()
@@ -359,8 +373,13 @@ class Logistic(BaseProbe):
         # Initialize network on first batch (use AdamW for streaming)
         if self._network is None:
             # Use stored n_epochs if available, otherwise default to 100
-            n_epochs = getattr(self, '_current_n_epochs', 100)
-            self._init_network(features.shape[1], dtype=features.dtype, use_lbfgs=False, n_epochs=n_epochs)
+            n_epochs = getattr(self, "_current_n_epochs", 100)
+            self._init_network(
+                features.shape[1],
+                dtype=features.dtype,
+                use_lbfgs=False,
+                n_epochs=n_epochs,
+            )
 
         # Update scaler statistics on first epoch only, then freeze
         if not self._scaler_frozen:
@@ -388,21 +407,28 @@ class Logistic(BaseProbe):
 
         self._streaming_steps += 1
         if self.verbose and self._streaming_steps % 50 == 0:
-            lr = self._optimizer.param_groups[0]['lr']
-            print(f"  Step {self._streaming_steps}: loss={loss.item():.4f}, lr={lr:.6f}")
+            lr = self._optimizer.param_groups[0]["lr"]
+            print(
+                f"  Step {self._streaming_steps}: loss={loss.item():.4f}, lr={lr:.6f}"
+            )
 
         self._network.eval()
         self._fitted = True
         return self
 
-    def predict_proba(self, X: Activations | ActivationIterator) -> torch.Tensor:
-        """Predict class probabilities.
+    def predict_proba(
+        self, X: Activations | ActivationIterator, *, logits: bool = False
+    ) -> torch.Tensor:
+        """Predict class probabilities or logits.
 
         Args:
             X: Activations or ActivationIterator containing features
+            logits: If True, return raw logits instead of probabilities.
+                Useful for adversarial training to avoid sigmoid saturation.
 
         Returns:
-            Tensor of shape (n_samples, 2) with probabilities for each class
+            If logits=False (default): Tensor of shape (n_samples, 2) with probabilities
+            If logits=True: Tensor of shape (n_samples,) with raw logits
         """
         if not self._fitted:
             raise RuntimeError("Probe must be fitted before prediction")
@@ -411,7 +437,7 @@ class Logistic(BaseProbe):
             # Predict on iterator batches
             predictions = []
             for batch_acts in X:
-                batch_probs = self.predict_proba(batch_acts)
+                batch_probs = self.predict_proba(batch_acts, logits=logits)
                 predictions.append(batch_probs)
             return torch.cat(predictions, dim=0)
 
@@ -424,9 +450,22 @@ class Logistic(BaseProbe):
 
         # Get predictions
         self._network.eval()
-        with torch.no_grad():
-            logits = self._network(features_scaled)
-            probs_positive = torch.sigmoid(logits)
+        raw_logits = self._network(features_scaled)
+
+        # Return logits directly if requested
+        if logits:
+            # Aggregate token predictions to sample predictions if needed
+            if (
+                self.sequence_pooling == SequencePooling.NONE
+                and self._tokens_per_sample is not None
+            ):
+                raw_logits = self.aggregate_token_predictions(
+                    raw_logits.unsqueeze(-1), self._tokens_per_sample, method="mean"
+                ).squeeze(-1)
+            return raw_logits
+
+        # Otherwise return probabilities
+        probs_positive = torch.sigmoid(raw_logits)
 
         # Create 2-class probability matrix
         probs = torch.stack([1 - probs_positive, probs_positive], dim=-1)
@@ -465,11 +504,13 @@ class Logistic(BaseProbe):
             "use_lbfgs": self._use_lbfgs,
             "streaming_steps": self._streaming_steps,
             "streaming_n_seen": self._streaming_n_seen,
-            "t": getattr(self, '_t', 0),
-            "lr": getattr(self, '_lr', 1e-3),
-            "alpha": getattr(self, '_alpha', 0.0),
-            "n_epochs": getattr(self, '_n_epochs', 100),
-            "scheduler_state": self._scheduler.state_dict() if self._scheduler is not None else None,
+            "t": getattr(self, "_t", 0),
+            "lr": getattr(self, "_lr", 1e-3),
+            "alpha": getattr(self, "_alpha", 0.0),
+            "n_epochs": getattr(self, "_n_epochs", 100),
+            "scheduler_state": self._scheduler.state_dict()
+            if self._scheduler is not None
+            else None,
         }
 
         torch.save(state, path)
@@ -497,7 +538,11 @@ class Logistic(BaseProbe):
             max_iter = state.get("max_iter", 100)
         else:
             # Old format with l2_penalty
-            C = 1.0 / state.get("l2_penalty", 1.0) if state.get("l2_penalty", 1.0) > 0 else 1.0
+            C = (
+                1.0 / state.get("l2_penalty", 1.0)
+                if state.get("l2_penalty", 1.0) > 0
+                else 1.0
+            )
             max_iter = state.get("n_epochs", 100)
 
         # Create probe instance

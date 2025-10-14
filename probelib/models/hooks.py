@@ -28,7 +28,7 @@ class HookedModel:
         self,
         model: "PreTrainedModel",
         layers: list[int],
-        detach_activations: bool = True,
+        detach_activations: bool = False,
         hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
     ):
         self.model = model

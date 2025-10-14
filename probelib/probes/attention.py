@@ -6,7 +6,6 @@ the most relevant parts for classification, instead of using fixed aggregation.
 """
 
 from pathlib import Path
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -16,7 +15,6 @@ from torch.optim import AdamW
 from ..processing.activations import (
     ActivationIterator,
     Activations,
-    RaggedActivations,
     SequencePooling,
 )
 from .base import BaseProbe
@@ -247,21 +245,13 @@ class Attention(BaseProbe):
             fused=self.device.startswith("cuda"),
         )
 
-    def _prepare_features(
-        self, X: Activations | RaggedActivations
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_features(self, X: Activations) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Prepare sequences for attention probe.
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]: (sequences, detection_mask)
         """
-        # Type-based dispatch
-        if isinstance(X, RaggedActivations):
-            # to_padded_batch returns (sequences, mask) where mask is all 1s for detected
-            # Use max_length parameter to prevent memory spikes from very long sequences
-            return X.to_padded_batch(self.layer, max_length=None)
-
         # Regular Activations (must have sequences)
         if self.layer not in X.layer_indices:
             raise ValueError(f"Layer {self.layer} not in activations")
@@ -274,7 +264,9 @@ class Attention(BaseProbe):
 
         return sequences, detection_mask
 
-    def fit(self, X: Activations | ActivationIterator, y: list | torch.Tensor) -> "Attention":
+    def fit(
+        self, X: Activations | ActivationIterator, y: list | torch.Tensor
+    ) -> "Attention":
         """
         Fit the probe on training data.
 
@@ -372,7 +364,9 @@ class Attention(BaseProbe):
         self._fitted = True
         return self
 
-    def _fit_iterator(self, X: ActivationIterator, y: list | torch.Tensor) -> "Attention":
+    def _fit_iterator(
+        self, X: ActivationIterator, y: list | torch.Tensor
+    ) -> "Attention":
         """
         Fit using an ActivationIterator (streaming mode).
 
@@ -435,22 +429,27 @@ class Attention(BaseProbe):
         self._network.eval()
         return self
 
-    def predict_proba(self, X: Activations | ActivationIterator) -> torch.Tensor:
+    def predict_proba(
+        self, X: Activations | ActivationIterator, *, logits: bool = False
+    ) -> torch.Tensor:
         """
-        Predict class probabilities.
+        Predict class probabilities or logits.
 
         Args:
             X: Activations or ActivationIterator containing features
+            logits: If True, return raw logits instead of probabilities.
+                Useful for adversarial training to avoid sigmoid saturation.
 
         Returns:
-            Tensor of shape (n_samples, 2) with probabilities for each class
+            If logits=False (default): Tensor of shape (n_samples, 2) with probabilities
+            If logits=True: Tensor of shape (n_samples,) with raw logits
         """
         if not self._fitted:
             raise RuntimeError("Probe must be fitted before prediction")
 
         if isinstance(X, ActivationIterator):
             # Predict on iterator batches
-            return self._predict_iterator(X)
+            return self._predict_iterator(X, logits=logits)
 
         # Get sequences and mask
         sequences, detection_mask = self._prepare_features(X)
@@ -459,12 +458,17 @@ class Attention(BaseProbe):
 
         # Get predictions
         self._network.eval()
-        with torch.no_grad():
-            logits, attention_weights = self._network(sequences, detection_mask)
-            probs_positive = torch.sigmoid(logits)
+        raw_logits, attention_weights = self._network(sequences, detection_mask)
 
-            # Store attention weights for interpretability
-            self.attention_weights = attention_weights.cpu()
+        # Store attention weights for interpretability (always detached)
+        self.attention_weights = attention_weights.detach().cpu()
+
+        # Return logits directly if requested
+        if logits:
+            return raw_logits
+
+        # Otherwise return probabilities
+        probs_positive = torch.sigmoid(raw_logits)
 
         # Create 2-class probability matrix
         probs = torch.zeros(len(probs_positive), 2, device=self.device)
@@ -473,12 +477,15 @@ class Attention(BaseProbe):
 
         return probs
 
-    def _predict_iterator(self, X: ActivationIterator) -> torch.Tensor:
+    def _predict_iterator(
+        self, X: ActivationIterator, logits: bool = False
+    ) -> torch.Tensor:
         """
         Predict on an ActivationIterator.
 
         Args:
             X: ActivationIterator yielding batches
+            logits: If True, return raw logits instead of probabilities
 
         Returns:
             Concatenated predictions for all batches
@@ -486,7 +493,7 @@ class Attention(BaseProbe):
         all_probs = []
 
         for batch_acts in X:
-            batch_probs = self.predict_proba(batch_acts)
+            batch_probs = self.predict_proba(batch_acts, logits=logits)
             all_probs.append(batch_probs)
 
         return torch.cat(all_probs, dim=0)
@@ -582,7 +589,6 @@ class Attention(BaseProbe):
         probe._fitted = True
 
         return probe
-
 
     def __repr__(self) -> str:
         """String representation of the probe."""

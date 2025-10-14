@@ -10,7 +10,7 @@ This library provides tools for:
 
 from . import datasets, masks, metrics, probes, processing, scripts
 from .models import HookedModel
-from .processing import Activations, RaggedActivations, collect_activations
+from .processing import Activations, collect_activations
 from .processing.activations import SequencePooling, detect_collection_strategy
 from .types import Dialogue, Label, Message
 from .visualization import print_metrics, visualize_mask
@@ -25,7 +25,6 @@ __all__ = [
     "detect_collection_strategy",
     "HookedModel",
     "Activations",
-    "RaggedActivations",
     "print_metrics",
     "visualize_mask",
     "scripts",

@@ -22,7 +22,7 @@ manifest.json
 # Extra data
 wandb/
 logs/
-# external/
+external/
 
 # Model checkpoints
 final_model/

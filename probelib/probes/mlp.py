@@ -146,7 +146,9 @@ class MLP(BaseProbe):
             # Use streaming for iterators
             labels = self._prepare_labels(y)
             for batch_acts in X:
-                batch_idx = torch.tensor(batch_acts.batch_indices, device=labels.device, dtype=torch.long)
+                batch_idx = torch.tensor(
+                    batch_acts.batch_indices, device=labels.device, dtype=torch.long
+                )
                 batch_labels = labels.index_select(0, batch_idx)
                 self.partial_fit(batch_acts, batch_labels)
             return self
@@ -254,14 +256,19 @@ class MLP(BaseProbe):
         self._fitted = True
         return self
 
-    def predict_proba(self, X: Activations | ActivationIterator) -> torch.Tensor:
-        """Predict class probabilities.
+    def predict_proba(
+        self, X: Activations | ActivationIterator, *, logits: bool = False
+    ) -> torch.Tensor:
+        """Predict class probabilities or logits.
 
         Args:
             X: Activations or ActivationIterator containing features
+            logits: If True, return raw logits instead of probabilities.
+                Useful for adversarial training to avoid sigmoid saturation.
 
         Returns:
-            Tensor of shape (n_samples, 2) with probabilities for each class
+            If logits=False (default): Tensor of shape (n_samples, 2) with probabilities
+            If logits=True: Tensor of shape (n_samples,) with raw logits
         """
         if not self._fitted:
             raise RuntimeError("Probe must be fitted before prediction")
@@ -270,7 +277,7 @@ class MLP(BaseProbe):
             # Predict on iterator batches
             predictions = []
             for batch_acts in X:
-                batch_probs = self.predict_proba(batch_acts)
+                batch_probs = self.predict_proba(batch_acts, logits=logits)
                 predictions.append(batch_probs)
             return torch.cat(predictions, dim=0)
 
@@ -280,15 +287,31 @@ class MLP(BaseProbe):
 
         # Get predictions
         self._network.eval()
-        with torch.no_grad():
-            logits = self._network(features)
-            probs_positive = torch.sigmoid(logits)
+        raw_logits = self._network(features)
+
+        # Return logits directly if requested
+        if logits:
+            # Aggregate token predictions to sample predictions if needed
+            if (
+                self.sequence_pooling == SequencePooling.NONE
+                and self._tokens_per_sample is not None
+            ):
+                raw_logits = self.aggregate_token_predictions(
+                    raw_logits.unsqueeze(-1), self._tokens_per_sample, method="mean"
+                ).squeeze(-1)
+            return raw_logits
+
+        # Otherwise return probabilities
+        probs_positive = torch.sigmoid(raw_logits)
 
         # Create 2-class probability matrix
         probs = torch.stack([1 - probs_positive, probs_positive], dim=-1)
 
         # Aggregate token predictions to sample predictions if needed
-        if self.sequence_pooling == SequencePooling.NONE and self._tokens_per_sample is not None:
+        if (
+            self.sequence_pooling == SequencePooling.NONE
+            and self._tokens_per_sample is not None
+        ):
             probs = self.aggregate_token_predictions(
                 probs, self._tokens_per_sample, method="mean"
             )

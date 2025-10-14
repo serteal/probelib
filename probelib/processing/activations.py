@@ -370,32 +370,41 @@ class Activations:
         """Create Activations from pre-extracted hidden states.
 
         This is designed for integration with external libraries (like inspect_ai or
-        control-arena) that return hidden states from model calls. It handles both
-        the nested tuple format from HuggingFace and pre-stacked tensors.
+        control-arena) that return hidden states from model calls. It handles three formats:
+        standard HuggingFace, generation (nested tuples), and pre-stacked tensors.
 
         Args:
-            hidden_states: Hidden states in one of two formats:
-                - HuggingFace format: tuple[tuple[Tensor, ...], ...] where outer tuple
-                  is generation steps, inner tuple is layers. Each tensor is [batch, seq, hidden].
+            hidden_states: Hidden states in one of three formats:
+                - **Standard HF format** (most common): tuple[Tensor, ...] where each tensor
+                  is a layer with shape [batch, seq, hidden].
+                  Example: `outputs.hidden_states` from `model(..., output_hidden_states=True)`
+                - **Generation format**: tuple[tuple[Tensor, ...], ...] where outer tuple
+                  is generation steps, inner tuple is layers. Each tensor is [batch, 1, hidden].
                   Example: ((layer0_step0, layer1_step0), (layer0_step1, layer1_step1))
-                - Stacked format: Tensor of shape [layer, batch, seq, hidden]
-            input_ids: Token IDs [batch, seq] (optional, defaults to ones)
-            attention_mask: Attention mask [batch, seq] (optional, defaults to ones)
-            detection_mask: Detection mask [batch, seq] (optional, defaults to ones)
-            layer_indices: Which layers these are from (optional, inferred as 0..N-1)
+                - **Stacked format**: Tensor of shape [layer, batch, seq, hidden]
+            input_ids: Token IDs [batch, seq] (optional, inferred from shapes)
+            attention_mask: Attention mask [batch, seq] (optional, defaults to all ones)
+            detection_mask: Detection mask [batch, seq] (optional, defaults to all ones)
+            layer_indices: Which layers to use (optional). For standard/generation format,
+                selects specific layers. For stacked format, indicates layer IDs.
             batch_indices: Batch indices for streaming (optional)
 
         Returns:
             Activations object ready for probe inference
 
         Examples:
-            # From inspect_ai metadata (nested tuples)
-            >>> message = state.messages[-1]  # ChatMessageAssistant
-            >>> hidden_states = message.metadata["hidden_states"]
+            # Standard HuggingFace format (simplest)
+            >>> outputs = model(input_ids, output_hidden_states=True)
             >>> acts = Activations.from_hidden_states(
-            ...     hidden_states,
-            ...     input_ids=tokenized["input_ids"],
-            ...     attention_mask=tokenized["attention_mask"]
+            ...     outputs.hidden_states,
+            ...     layer_indices=[16],  # Select layer 16
+            ... )
+
+            # With detection mask
+            >>> acts = Activations.from_hidden_states(
+            ...     outputs.hidden_states,
+            ...     layer_indices=[16],
+            ...     detection_mask=my_mask  # [batch, seq]
             ... )
 
             # From pre-stacked tensor
@@ -406,45 +415,83 @@ class Activations:
             ValueError: If hidden_states format is invalid or empty
             TypeError: If hidden_states is not tuple or Tensor
         """
-        # Handle nested tuple format (HuggingFace)
+        # Handle tuple format (HuggingFace)
         if isinstance(hidden_states, tuple):
-            # hidden_states: tuple of tuples
-            # Outer tuple = generation steps (one per generated token)
-            # Inner tuple = layers (one per model layer)
-            # Each tensor = [batch, 1, hidden] for single token generation
-
-            num_steps = len(hidden_states)
-            if num_steps == 0:
+            if len(hidden_states) == 0:
                 raise ValueError("Empty hidden_states tuple")
 
-            num_layers = len(hidden_states[0])
-            if num_layers == 0:
-                raise ValueError("Empty layer tuple in hidden_states")
+            # Detect format by checking first element
+            first_elem = hidden_states[0]
 
-            # Verify all steps have same number of layers
-            for step_idx, step_tuple in enumerate(hidden_states):
-                if len(step_tuple) != num_layers:
-                    raise ValueError(
-                        f"Inconsistent layer count: step 0 has {num_layers} layers, "
-                        f"step {step_idx} has {len(step_tuple)} layers"
-                    )
+            # Standard format: tuple of tensors (one per layer)
+            # Each tensor: [batch, seq, hidden]
+            if isinstance(first_elem, torch.Tensor):
+                # Standard HF forward pass: (layer_0, layer_1, ..., layer_N)
+                # Filter to requested layers if specified
+                if layer_indices is not None:
+                    if not isinstance(layer_indices, (list, tuple)):
+                        layer_indices_to_select = [layer_indices]
+                    else:
+                        layer_indices_to_select = list(layer_indices)
+                    selected_layers = [hidden_states[idx] for idx in layer_indices_to_select]
+                    # Track which layers we selected
+                    actual_layer_indices = layer_indices_to_select
+                else:
+                    # Use all layers
+                    selected_layers = list(hidden_states)
+                    actual_layer_indices = list(range(len(hidden_states)))
 
-            # Collect all tensors per layer across steps
-            layer_tensors = []
-            for layer_idx in range(num_layers):
-                # Get all tensors for this layer across generation steps
-                step_tensors = [
-                    hidden_states[step_idx][layer_idx] for step_idx in range(num_steps)
-                ]
+                # Stack to get [layer, batch, seq, hidden]
+                activations_tensor = torch.stack(selected_layers, dim=0)
 
-                # Each step_tensor is [batch, 1, hidden] for single-token generation
-                # or [batch, seq_len, hidden] for multi-token
-                # Concatenate along sequence dimension
-                layer_tensor = torch.cat(step_tensors, dim=1)  # [batch, total_seq, hidden]
-                layer_tensors.append(layer_tensor)
+            # Nested tuple format: tuple of tuples (generation steps)
+            # Outer tuple = generation steps, inner tuple = layers
+            elif isinstance(first_elem, (tuple, list)):
+                # Generation format: ((step0_layer0, step0_layer1, ...), (step1_layer0, ...), ...)
+                num_steps = len(hidden_states)
+                num_layers = len(hidden_states[0])
 
-            # Stack layers to get [layer, batch, seq, hidden]
-            activations_tensor = torch.stack(layer_tensors, dim=0)
+                if num_layers == 0:
+                    raise ValueError("Empty layer tuple in hidden_states")
+
+                # Verify all steps have same number of layers
+                for step_idx, step_tuple in enumerate(hidden_states):
+                    if len(step_tuple) != num_layers:
+                        raise ValueError(
+                            f"Inconsistent layer count: step 0 has {num_layers} layers, "
+                            f"step {step_idx} has {len(step_tuple)} layers"
+                        )
+
+                # Determine which layers to use
+                if layer_indices is not None:
+                    if not isinstance(layer_indices, (list, tuple)):
+                        selected_layer_indices = [layer_indices]
+                    else:
+                        selected_layer_indices = list(layer_indices)
+                    actual_layer_indices = selected_layer_indices
+                else:
+                    selected_layer_indices = list(range(num_layers))
+                    actual_layer_indices = selected_layer_indices
+
+                # Collect tensors for selected layers across generation steps
+                layer_tensors = []
+                for layer_idx in selected_layer_indices:
+                    # Get all tensors for this layer across generation steps
+                    step_tensors = [
+                        hidden_states[step_idx][layer_idx] for step_idx in range(num_steps)
+                    ]
+
+                    # Concatenate along sequence dimension
+                    layer_tensor = torch.cat(step_tensors, dim=1)  # [batch, total_seq, hidden]
+                    layer_tensors.append(layer_tensor)
+
+                # Stack layers to get [layer, batch, seq, hidden]
+                activations_tensor = torch.stack(layer_tensors, dim=0)
+            else:
+                raise TypeError(
+                    f"Expected tuple of Tensors or tuple of tuples, "
+                    f"got tuple of {type(first_elem)}"
+                )
 
         elif isinstance(hidden_states, torch.Tensor):
             activations_tensor = hidden_states
@@ -453,6 +500,9 @@ class Activations:
                     f"Expected 4D tensor [layer, batch, seq, hidden], "
                     f"got shape {activations_tensor.shape}"
                 )
+            # For tensor input, layer_indices indicates what layers these are
+            # (no selection happens here, just labeling)
+            actual_layer_indices = layer_indices
         else:
             raise TypeError(
                 f"hidden_states must be tuple or Tensor, got {type(hidden_states)}"
@@ -461,7 +511,7 @@ class Activations:
         # Use existing from_tensor to handle the rest
         return cls.from_tensor(
             activations=activations_tensor,
-            layer_indices=layer_indices,
+            layer_indices=actual_layer_indices,
             attention_mask=attention_mask,
             detection_mask=detection_mask,
             input_ids=input_ids,
@@ -929,69 +979,6 @@ class Activations:
 
         return features, tokens_per_sample.to(device=acts.device)
 
-    def to_ragged(self) -> "RaggedActivations":
-        """Convert to ragged format by extracting only detected tokens.
-
-        This creates RaggedActivations by selecting tokens where detection_mask=1.
-        Eliminates padding waste.
-
-        Returns:
-            RaggedActivations with only detected tokens
-
-        Example:
-            >>> acts = collect_activations(model, tokenizer, data, layers=20, batch_size=8)
-            >>> acts.shape  # [1, 30000, 512, 4096]
-            >>> ragged = acts.to_ragged()
-            >>> ragged.n_samples  # 30000
-            >>> # Each sample has only detected tokens (no padding)
-        """
-        self.expect_axes(Axis.SEQ)
-        seq_meta = self._require_sequence_meta()
-
-        ragged_activations = []
-        ragged_input_ids = []
-
-        detection_mask = seq_meta.detection_mask
-        input_ids = seq_meta.input_ids
-
-        # Extract detected tokens per sample
-        for i in range(self.batch_size):
-            sample_mask = detection_mask[i].bool()
-            n_detected = sample_mask.sum().item()
-
-            if n_detected > 0:
-                # Extract [n_layers, n_detected, hidden]
-                if self.has_axis(Axis.LAYER):
-                    detected_acts = self.activations[:, i, sample_mask, :]
-                else:
-                    # Single layer - add layer dimension
-                    detected_acts = self.activations[i, sample_mask, :].unsqueeze(0)
-
-                detected_ids = input_ids[i, sample_mask]
-            else:
-                # Empty sample edge case
-                if self.has_axis(Axis.LAYER):
-                    n_layers = self.n_layers
-                else:
-                    n_layers = 1
-
-                detected_acts = torch.zeros(
-                    (n_layers, 0, self.d_model),
-                    dtype=self.activations.dtype,
-                    device=self.activations.device,
-                )
-                detected_ids = torch.zeros(0, dtype=torch.long, device=input_ids.device)
-
-            ragged_activations.append(detected_acts)
-            ragged_input_ids.append(detected_ids)
-
-        return RaggedActivations(
-            ragged_activations=ragged_activations,
-            layer_indices=self.layer_indices if self.has_axis(Axis.LAYER) else [0],
-            input_ids=ragged_input_ids,
-            batch_indices=self.batch_indices.tolist() if self.batch_indices is not None else None,
-        )
-
     # ------------------------------------------------------------------
     # Internal sequence reduction
     # ------------------------------------------------------------------
@@ -1073,243 +1060,6 @@ class Activations:
         return reduced
 
 
-@dataclass(slots=True)
-class RaggedActivations:
-    """Container for variable-length activation sequences.
-
-    Stores only detected tokens (where detection_mask=1), eliminating padding waste.
-    Each sample has variable sequence length containing only the detected tokens.
-
-    Key design: No detection_masks needed - all stored tokens are detected by definition.
-
-    Storage format:
-        ragged_activations: List of [n_layers, seq_len_i, hidden] tensors
-        Each tensor contains ONLY detected tokens for that sample
-    """
-
-    # Core data: list of variable-length tensors (detected tokens only)
-    ragged_activations: list[torch.Tensor]  # Each: [n_layers, seq_len_i, hidden]
-    layer_indices: list[int]  # Which layers (e.g., [20])
-
-    # Metadata (no masks - all tokens are detected)
-    input_ids: list[torch.Tensor]  # Each: [seq_len_i] - detected token IDs
-    batch_indices: list[int] | None = None
-
-    def __post_init__(self):
-        """Validate ragged activations with enhanced checks."""
-        n_samples = len(self.ragged_activations)
-        if n_samples == 0:
-            raise ValueError("ragged_activations cannot be empty")
-
-        # Validate dimensions
-        n_layers = self.ragged_activations[0].shape[0]
-        hidden_dim = self.ragged_activations[0].shape[-1]
-
-        for i, acts in enumerate(self.ragged_activations):
-            if acts.ndim != 3:
-                raise ValueError(
-                    f"Sample {i}: expected [n_layers, seq, hidden], got {acts.shape}"
-                )
-            if acts.shape[0] != n_layers:
-                raise ValueError(
-                    f"Sample {i}: expected {n_layers} layers, got {acts.shape[0]}"
-                )
-            if acts.shape[-1] != hidden_dim:
-                raise ValueError(
-                    f"Sample {i}: expected hidden_dim={hidden_dim}, got {acts.shape[-1]}"
-                )
-
-        # Validate device consistency
-        devices = {acts.device for acts in self.ragged_activations}
-        if len(devices) > 1:
-            raise ValueError(
-                f"Mixed devices in ragged activations: {devices}. "
-                f"All tensors must be on the same device."
-            )
-
-        # Validate dtype consistency
-        dtypes = {acts.dtype for acts in self.ragged_activations}
-        if len(dtypes) > 1:
-            raise ValueError(
-                f"Mixed dtypes in ragged activations: {dtypes}. "
-                f"All tensors must have the same dtype."
-            )
-
-        # Validate metadata
-        if len(self.input_ids) != n_samples:
-            raise ValueError("input_ids length must match ragged_activations")
-
-        for i, (acts, ids) in enumerate(zip(self.ragged_activations, self.input_ids)):
-            seq_len = acts.shape[1]
-            if ids.shape[0] != seq_len:
-                raise ValueError(f"Sample {i}: ids length {ids.shape[0]} != seq_len {seq_len}")
-
-        if self.batch_indices is not None and len(self.batch_indices) != n_samples:
-            raise ValueError("batch_indices length must match ragged_activations")
-
-    # Properties
-    @property
-    def n_samples(self) -> int:
-        return len(self.ragged_activations)
-
-    @property
-    def n_layers(self) -> int:
-        return len(self.layer_indices)
-
-    @property
-    def hidden_dim(self) -> int:
-        return self.ragged_activations[0].shape[-1]
-
-    @property
-    def device(self) -> torch.device:
-        return self.ragged_activations[0].device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.ragged_activations[0].dtype
-
-    def pool(self, method: Literal["mean", "max", "last_token"]) -> Activations:
-        """Pool ragged sequences to [n_layers, n_samples, hidden].
-
-        Returns regular Activations (not ragged) with pooled features.
-        All tokens are detected, so no masking needed during pooling.
-        """
-        pooled = torch.zeros(
-            (self.n_layers, self.n_samples, self.hidden_dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-        for i, acts in enumerate(self.ragged_activations):
-            # acts: [n_layers, seq_len, hidden] - all tokens are detected
-            if acts.shape[1] == 0:
-                # Empty sequence - leave as zeros
-                continue
-
-            if method == "mean":
-                pooled[:, i, :] = acts.mean(dim=1)
-            elif method == "max":
-                pooled[:, i, :] = acts.max(dim=1).values
-            elif method == "last_token":
-                pooled[:, i, :] = acts[:, -1, :]
-            else:
-                raise ValueError(f"Unknown pooling method: {method}")
-
-        return Activations(
-            activations=pooled,
-            axes=(Axis.LAYER, Axis.BATCH, Axis.HIDDEN),
-            layer_meta=LayerMeta(tuple(self.layer_indices)),
-            sequence_meta=None,
-            batch_indices=(
-                torch.tensor(self.batch_indices, dtype=torch.long)
-                if self.batch_indices is not None
-                else torch.arange(self.n_samples, dtype=torch.long)
-            ),
-        )
-
-    def select_layer(self, layer: int) -> "RaggedActivations":
-        """Select a single layer."""
-        if layer not in self.layer_indices:
-            raise ValueError(f"Layer {layer} not in ragged activations: {self.layer_indices}")
-
-        layer_idx = self.layer_indices.index(layer)
-        new_ragged = [acts[layer_idx:layer_idx+1] for acts in self.ragged_activations]
-
-        return RaggedActivations(
-            ragged_activations=new_ragged,
-            layer_indices=[layer],
-            input_ids=self.input_ids,
-            batch_indices=self.batch_indices,
-        )
-
-    def extract_tokens_for_layer(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract all tokens for a layer, flattened across samples.
-
-        Returns:
-            features: [total_tokens, hidden] concatenated tokens
-            tokens_per_sample: [n_samples] count of tokens per sample
-        """
-        if layer not in self.layer_indices:
-            raise ValueError(f"Layer {layer} not in ragged activations")
-
-        layer_idx = self.layer_indices.index(layer)
-
-        all_tokens = []
-        tokens_per_sample = []
-
-        for sample_acts in self.ragged_activations:
-            layer_acts = sample_acts[layer_idx]  # [seq_len, hidden]
-            all_tokens.append(layer_acts)
-            tokens_per_sample.append(layer_acts.shape[0])
-
-        features = torch.cat(all_tokens, dim=0)  # [total_tokens, hidden]
-        counts = torch.tensor(tokens_per_sample, dtype=torch.long, device=features.device)
-
-        return features, counts
-
-    def to_padded_batch(
-        self,
-        layer: int,
-        max_length: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert ragged to dense padded batch for a single layer.
-
-        Pads to the maximum sequence length in THIS batch, not dataset max.
-        Used by Attention probe for batch processing.
-
-        Args:
-            layer: Layer to extract
-            max_length: Optional maximum length to cap padding (prevents memory spikes
-                when one sequence is very long). Sequences longer than this are truncated.
-
-        Returns:
-            sequences: [n_samples, max_seq_in_batch, hidden]
-            detection_mask: [n_samples, max_seq_in_batch] - all 1s for detected tokens
-        """
-        if layer not in self.layer_indices:
-            raise ValueError(f"Layer {layer} not in ragged activations")
-
-        layer_idx = self.layer_indices.index(layer)
-
-        # Find max length in this batch (not dataset!)
-        batch_max_len = max(acts.shape[1] for acts in self.ragged_activations)
-
-        # Apply max_length cap if specified
-        if max_length is not None:
-            max_seq_len = min(batch_max_len, max_length)
-        else:
-            max_seq_len = batch_max_len
-
-        # Allocate padded tensors
-        sequences = torch.zeros(
-            (self.n_samples, max_seq_len, self.hidden_dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        detection_mask = torch.zeros(
-            (self.n_samples, max_seq_len),
-            dtype=torch.float32,
-            device=self.device,
-        )
-
-        # Fill with ragged data
-        for i, sample_acts in enumerate(self.ragged_activations):
-            layer_acts = sample_acts[layer_idx]  # [seq_len, hidden]
-            seq_len = min(layer_acts.shape[0], max_seq_len)  # Truncate if needed
-
-            sequences[i, :seq_len, :] = layer_acts[:seq_len]
-            detection_mask[i, :seq_len] = 1.0  # All tokens are detected
-
-        return sequences, detection_mask
-
-    def to(self, device: str | torch.device) -> "RaggedActivations":
-        """Move all tensors to device."""
-        return RaggedActivations(
-            ragged_activations=[acts.to(device) for acts in self.ragged_activations],
-            layer_indices=self.layer_indices,
-            input_ids=[ids.to(device) for ids in self.input_ids],
-            batch_indices=self.batch_indices,
-        )
 
 
 def streaming_activations(
@@ -1320,6 +1070,7 @@ def streaming_activations(
     batch_size: int = 8,
     verbose: bool = False,
     hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
+    detach_activations: bool = False,
 ) -> Generator[Activations, None, None]:
     """
     Generator that yields Activations batches with all optimizations preserved.
@@ -1349,7 +1100,7 @@ def streaming_activations(
     n_samples = tokenized_inputs["input_ids"].shape[0]
 
     # Use HookedModel context for all batches (preserves buffer reuse optimization)
-    with HookedModel(model, layers, hook_point=hook_point) as hooked_model:
+    with HookedModel(model, layers, detach_activations=detach_activations, hook_point=hook_point) as hooked_model:
         # Get optimized batches with sorting and views
         batch_iter = get_batches(tokenized_inputs, batch_size, tokenizer)
 
@@ -1388,6 +1139,7 @@ def batch_activations(
     batch_size: int = 8,
     verbose: bool = False,
     hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
+    detach_activations: bool = False,
 ) -> Activations:
     """
     Collect all activations at once into a single Activations object.
@@ -1422,7 +1174,7 @@ def batch_activations(
             dtype=model.dtype,
         )
 
-        with HookedModel(model, layers, hook_point=hook_point) as hooked_model:
+        with HookedModel(model, layers, detach_activations=detach_activations, hook_point=hook_point) as hooked_model:
             batches = get_batches(tokenized_inputs, batch_size, tokenizer)
 
             if verbose:
@@ -1453,7 +1205,7 @@ def batch_activations(
         batch_list = []
         indices_list = []
 
-        with HookedModel(model, layers, hook_point=hook_point) as hooked_model:
+        with HookedModel(model, layers, detach_activations=detach_activations, hook_point=hook_point) as hooked_model:
             batches = get_batches(tokenized_inputs, batch_size, tokenizer)
 
             if verbose:
@@ -1505,97 +1257,6 @@ def batch_activations(
     )
 
 
-def batch_activations_ragged(
-    model: "PreTrainedModel",
-    tokenizer: "PreTrainedTokenizerBase",
-    tokenized_inputs: dict[str, torch.Tensor],
-    layers: list[int],
-    batch_size: int = 8,
-    verbose: bool = False,
-    hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
-) -> RaggedActivations:
-    """Collect only detected tokens (where detection_mask=1).
-
-    Peak memory: One batch (~2 GB)
-    Resident memory: Detected tokens only (~60 MB for avg 128 tokens/sample)
-
-    Note: No detection masks stored in RaggedActivations - all tokens are detected.
-
-    Args:
-        model: Model to extract activations from
-        tokenizer: Tokenizer for padding info
-        tokenized_inputs: Pre-tokenized inputs
-        layers: Layer indices to extract
-        batch_size: Batch size for processing
-        verbose: Whether to show progress
-        hook_point: Where to extract activations
-
-    Returns:
-        RaggedActivations with only detected tokens
-    """
-    ragged_activations = []
-    ragged_input_ids = []
-    ragged_batch_indices = []
-
-    with HookedModel(model, layers, hook_point=hook_point) as hooked_model:
-        batches = get_batches(tokenized_inputs, batch_size, tokenizer)
-
-        if verbose:
-            n_samples = tokenized_inputs["input_ids"].shape[0]
-            batches = tqdm(
-                batches,
-                desc="Collecting (ragged)",
-                total=(n_samples + batch_size - 1) // batch_size,
-            )
-
-        for batch_inputs, batch_indices in batches:
-            batch_inputs = {
-                k: v.to(model.device) if isinstance(v, torch.Tensor) else v
-                for k, v in batch_inputs.items()
-            }
-
-            # Get full batch [n_layers, batch_size, seq_len, hidden]
-            batch_acts = hooked_model.get_activations(batch_inputs)
-            detection_mask = batch_inputs["detection_mask"]
-            input_ids = batch_inputs["input_ids"]
-
-            # Extract detected tokens per sample
-            for i, batch_idx in enumerate(batch_indices):
-                sample_mask = detection_mask[i].bool()
-                n_detected = sample_mask.sum().item()
-
-                if n_detected > 0:
-                    # Extract ONLY detected tokens: [n_layers, n_detected, hidden]
-                    detected_acts = batch_acts[:, i, sample_mask, :].cpu()
-                    detected_ids = input_ids[i, sample_mask].cpu()
-                else:
-                    # Empty sample edge case
-                    detected_acts = torch.zeros(
-                        (len(layers), 0, batch_acts.shape[-1]),
-                        dtype=batch_acts.dtype,
-                        device="cpu",
-                    )
-                    detected_ids = torch.zeros(0, dtype=torch.long)
-
-                ragged_activations.append(detected_acts)
-                ragged_input_ids.append(detected_ids)
-                ragged_batch_indices.append(batch_idx)
-
-            # batch_acts freed - only 2 GB peak!
-
-    if verbose:
-        total_tokens = sum(acts.shape[1] for acts in ragged_activations)
-        avg_tokens = total_tokens / len(ragged_activations)
-        max_tokens = max(acts.shape[1] for acts in ragged_activations)
-        print(f"Ragged: avg={avg_tokens:.1f}, max={max_tokens} tokens/sample")
-
-    return RaggedActivations(
-        ragged_activations=ragged_activations,
-        layer_indices=layers,
-        input_ids=ragged_input_ids,
-        batch_indices=ragged_batch_indices,
-    )
-
 
 def batch_activations_pooled(
     model: "PreTrainedModel",
@@ -1606,6 +1267,7 @@ def batch_activations_pooled(
     pooling_method: Literal["mean", "max", "last_token"],
     verbose: bool = False,
     hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
+    detach_activations: bool = False,
 ) -> Activations:
     """Collect and pool in one pass.
 
@@ -1670,6 +1332,10 @@ def batch_activations_pooled(
             # Reuse existing pooling logic
             pooled_batch = batch_acts_obj._reduce_sequence(pooling_method)
 
+            # Detach if requested (even though hook should have detached, pooling can reconnect gradients)
+            if detach_activations:
+                pooled_batch = pooled_batch.detach()
+
             # Store and free batch_acts
             pooled_storage[:, batch_indices] = pooled_batch.cpu()
             # batch_acts freed here - only 2 GB peak!
@@ -1703,6 +1369,7 @@ class ActivationIterator:
         verbose: bool,
         num_batches: int,
         hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
+        detach_activations: bool = False,
     ):
         """
         Initialize the regenerable iterator.
@@ -1715,6 +1382,7 @@ class ActivationIterator:
             batch_size: Batch size for processing
             verbose: Whether to show progress
             num_batches: Total number of batches
+            detach_activations: Whether to detach activations
             hook_point: Where to extract activations
         """
         self._model = model
@@ -1725,6 +1393,7 @@ class ActivationIterator:
         self._verbose = verbose
         self._num_batches = num_batches
         self._hook_point = hook_point
+        self._detach_activations = detach_activations
 
     def __iter__(self) -> Iterator[Activations]:
         """Create and return a fresh generator for activation batches."""
@@ -1734,6 +1403,7 @@ class ActivationIterator:
             tokenized_inputs=self._tokenized_inputs,
             layers=self._layers,
             batch_size=self._batch_size,
+            detach_activations=self._detach_activations,
             verbose=self._verbose,
             hook_point=self._hook_point,
         )
@@ -1753,14 +1423,13 @@ def detect_collection_strategy(probes: dict[str, "BaseProbe"]) -> str | None:
 
     Returns:
         - "mean", "max", "last_token": Pool during collection
-        - "ragged": Collect detected tokens only
-        - None: Dense collection (default)
+        - None: Dense collection (default - used when sequences needed or mixed pooling)
     """
     from ..probes.base import BaseProbe  # Import here to avoid circular dependency
 
     # Check if any probe requires sequences
     if any(p.requires_sequences for p in probes.values()):
-        return "ragged"
+        return None  # Dense collection preserves sequences
 
     # Check if all probes use the same pooling method
     pooling_methods = {p.preferred_pooling for p in probes.values() if p.preferred_pooling}
@@ -1768,7 +1437,7 @@ def detect_collection_strategy(probes: dict[str, "BaseProbe"]) -> str | None:
     if len(pooling_methods) == 1:
         return list(pooling_methods)[0]  # "mean", "max", or "last_token"
     elif len(pooling_methods) > 1:
-        return "ragged"  # Multiple methods need sequences
+        return None  # Multiple methods need sequences - use dense
     else:
         return None  # Default to dense
 
@@ -1778,7 +1447,7 @@ def detect_collection_strategy(probes: dict[str, "BaseProbe"]) -> str | None:
 def collect_activations(
     model: "PreTrainedModel",
     tokenizer: "PreTrainedTokenizerBase",
-    data: DialogueDataset | Sequence[Dialogue],
+    dataset: DialogueDataset,
     *,
     layers: int | list[int],
     batch_size: int,
@@ -1787,9 +1456,10 @@ def collect_activations(
     streaming: Literal[False] = False,
     verbose: bool = False,
     hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
-    collection_strategy: Literal["mean", "max", "last_token", "ragged"] | None = None,
+    collection_strategy: Literal["mean", "max", "last_token"] | None = None,
+    detach_activations: bool = False,
     **tokenize_kwargs: Any,
-) -> Activations | RaggedActivations: ...
+) -> Activations: ...
 
 
 # Adds overlading for correct return type inference from collect_activations
@@ -1797,7 +1467,7 @@ def collect_activations(
 def collect_activations(
     model: "PreTrainedModel",
     tokenizer: "PreTrainedTokenizerBase",
-    data: DialogueDataset | Sequence[Dialogue],
+    dataset: DialogueDataset,
     *,
     layers: int | list[int],
     batch_size: int,
@@ -1806,7 +1476,8 @@ def collect_activations(
     streaming: Literal[True],
     verbose: bool = False,
     hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
-    collection_strategy: Literal["mean", "max", "last_token", "ragged"] | None = None,
+    collection_strategy: Literal["mean", "max", "last_token"] | None = None,
+    detach_activations: bool = False,
     **tokenize_kwargs: Any,
 ) -> ActivationIterator: ...
 
@@ -1814,7 +1485,7 @@ def collect_activations(
 def collect_activations(
     model: "PreTrainedModel",
     tokenizer: "PreTrainedTokenizerBase",
-    data: DialogueDataset | Sequence[Dialogue],
+    dataset: DialogueDataset,
     *,
     layers: int | list[int],
     batch_size: int,
@@ -1823,10 +1494,11 @@ def collect_activations(
     streaming: bool = False,
     verbose: bool = False,
     hook_point: Literal["pre_layernorm", "post_block"] = "post_block",
-    collection_strategy: Literal["mean", "max", "last_token", "ragged"] | None = None,
+    collection_strategy: Literal["mean", "max", "last_token"] | None = None,
+    detach_activations: bool = False,
     **tokenize_kwargs: Any,
-) -> Activations | RaggedActivations | ActivationIterator:
-    """Entry point for activation collection across datasets or dialogue lists.
+) -> Activations | ActivationIterator:
+    """Entry point for activation collection from datasets.
 
     The function tokenizes once, applies any mask exactly once, and then either
     returns a materialized :class:`Activations` tensor or a streaming iterator
@@ -1837,12 +1509,11 @@ def collect_activations(
     Args:
         model: Model providing hidden states.
         tokenizer: Tokenizer aligned with ``model``.
-        data: Dialogue dataset or plain list of :class:`Dialogue` objects.
+        dataset: DialogueDataset containing dialogues and labels.
         layers: Layer index or indices to record.
         batch_size: Number of sequences per activation batch.
-        mask: Optional token mask. ``None`` applies ``dataset.default_mask`` when
-            a dataset instance is supplied; pass an explicit mask such as
-            ``masks.all()`` to disable masking.
+        mask: Optional token mask. ``None`` applies ``dataset.default_mask``;
+            pass an explicit mask such as ``masks.all()`` to override.
         verbose: Toggle progress reporting.
         add_generation_prompt: Whether to append generation tokens before
             tokenization.
@@ -1856,48 +1527,35 @@ def collect_activations(
         collection_strategy: How to collect activations:
             - None: Dense collection (default) - stores full sequences
             - "mean", "max", "last_token": Pool during collection → Activations
-              (440x memory reduction: 240GB → 480MB)
-            - "ragged": Collect only detected tokens → RaggedActivations
-              (2000x memory reduction: 240GB → 60MB)
+              (440x memory reduction: 240GB → 480MB, no sequence dimension)
+        detach_activations: Whether to detach activations from the computation graph.
+            - False (default): Keep gradients (enables differentiable probe predictions)
+            - True: Detach for memory efficiency (use for probe training/evaluation)
         **tokenize_kwargs: Extra tokenizer arguments.
 
     Returns:
         - Activations: For dense or pooled collection
-        - RaggedActivations: For ragged collection (detected tokens only)
         - ActivationIterator: For streaming mode
 
     Examples:
         # Default: dense collection
-        >>> acts = collect_activations(model, tokenizer, data, layers=20, batch_size=8)
+        >>> dataset = pl.datasets.CircuitBreakersDataset()
+        >>> acts = collect_activations(model, tokenizer, dataset, layers=20, batch_size=8)
         >>> isinstance(acts, Activations)  # True
         >>> acts.shape  # [1, 30000, 512, 4096]
 
         # Pooled collection (440x memory reduction)
         >>> acts = collect_activations(
-        ...     model, tokenizer, data, layers=20, batch_size=8,
+        ...     model, tokenizer, dataset, layers=20, batch_size=8,
         ...     collection_strategy="mean"
         ... )
         >>> isinstance(acts, Activations)  # True
         >>> acts.shape  # [1, 30000, 4096] - no sequence dimension
-
-        # Ragged collection (2000x memory reduction)
-        >>> ragged = collect_activations(
-        ...     model, tokenizer, data, layers=20, batch_size=8,
-        ...     collection_strategy="ragged"
-        ... )
-        >>> isinstance(ragged, RaggedActivations)  # True
     """
     if isinstance(layers, int):
         layers = [layers]
 
-    # Determine if we're working with a dataset or raw dialogues
-    if isinstance(data, DialogueDataset):
-        dataset = data
-        dialogues = dataset.dialogues
-    else:
-        # data is a sequence of Dialogue objects
-        dataset = None
-        dialogues = list(data)  # Ensure it's a list
+    dialogues = dataset.dialogues
 
     # Set up tokenizer
     if tokenizer.pad_token_id is None:
@@ -1916,7 +1574,7 @@ def collect_activations(
         dialogues=dialogues,
         mask=mask,  # Pass mask if provided
         device="cpu",
-        dataset=dataset,  # Pass dataset if available for default mask
+        dataset=dataset,  # Pass dataset for default mask
         add_generation_prompt=add_generation_prompt,
         **default_tokenize_kwargs,
     )
@@ -1935,22 +1593,20 @@ def collect_activations(
             verbose=verbose,
             num_batches=num_batches,
             hook_point=hook_point,
+            detach_activations=detach_activations,
         )
     else:
         # Route based on collection strategy
-        if collection_strategy == "ragged":
-            return batch_activations_ragged(
-                model, tokenizer, tokenized_inputs, layers,
-                batch_size, verbose, hook_point
-            )
-        elif collection_strategy in ("mean", "max", "last_token"):
+        if collection_strategy in ("mean", "max", "last_token"):
             return batch_activations_pooled(
                 model, tokenizer, tokenized_inputs, layers,
-                batch_size, collection_strategy, verbose, hook_point
+                batch_size, collection_strategy, verbose, hook_point,
+                detach_activations
             )
         else:
             # Default: dense collection
             return batch_activations(
                 model, tokenizer, tokenized_inputs, layers,
-                batch_size, verbose, hook_point
+                batch_size, verbose, hook_point,
+                detach_activations
             )
