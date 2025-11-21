@@ -78,7 +78,7 @@ class TestBaseProbe:
         acts = torch.randn(1, 4, 8, 16)  # 1 layer, 4 batch, 8 seq, 16 dim
         detection_mask = torch.ones(4, 8)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(4, 8),
             input_ids=torch.ones(4, 8),
@@ -104,7 +104,7 @@ class TestBaseProbe:
             ]
         ).float()
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, 8),
             input_ids=torch.ones(2, 8),
@@ -124,7 +124,7 @@ class TestBaseProbe:
 
         # Create activations with multiple layers
         acts = torch.randn(3, 2, 8, 16)
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, 8),
             input_ids=torch.ones(2, 8),

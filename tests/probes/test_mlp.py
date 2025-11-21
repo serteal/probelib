@@ -17,7 +17,7 @@ def create_test_activations(n_samples=10, seq_len=20, d_model=16, layer=0):
     acts = torch.randn(1, n_samples, seq_len, d_model)
     detection_mask = torch.ones(n_samples, seq_len)
 
-    return Activations(
+    return Activations.from_tensor(
         activations=acts,
         attention_mask=torch.ones(n_samples, seq_len),
         input_ids=torch.ones(n_samples, seq_len, dtype=torch.long),
@@ -43,7 +43,7 @@ def create_separable_data(n_samples=20, seq_len=10, d_model=8, layer=0):
     # Add small noise
     acts += torch.randn_like(acts) * 0.1
 
-    activations = Activations(
+    activations = Activations.from_tensor(
         activations=acts,
         attention_mask=torch.ones(n_samples, seq_len),
         input_ids=torch.ones(n_samples, seq_len, dtype=torch.long),
@@ -69,7 +69,6 @@ class TestMLP:
             learning_rate=0.002,
             weight_decay=0.05,
             n_epochs=200,
-            patience=10,
             sequence_pooling=SequencePooling.MAX,
             device="cpu",
             random_state=42,
@@ -83,7 +82,6 @@ class TestMLP:
         assert probe.learning_rate == 0.002
         assert probe.weight_decay == 0.05
         assert probe.n_epochs == 200
-        assert probe.patience == 10
         assert probe.sequence_pooling == SequencePooling.MAX
         # score_aggregation no longer exists
         assert probe._fitted is False
@@ -116,7 +114,6 @@ class TestMLP:
             layer=0,
             hidden_dim=32,
             n_epochs=100,
-            patience=10,
             device="cpu",
             random_state=42,
         )
@@ -233,6 +230,7 @@ class TestMLP:
             assert loaded_probe._fitted is True
 
             probs_after = loaded_probe.predict_proba(activations)
+            probs_before = probs_before.to(probs_after.device)
             assert torch.allclose(probs_before, probs_after, atol=1e-6)
 
     def test_different_activations(self):

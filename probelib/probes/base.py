@@ -64,6 +64,11 @@ class BaseProbe(ABC):
         self._tokens_per_sample = None  # Set when sequence_pooling=NONE
 
     @property
+    def requires_grad(self) -> bool:
+        """Whether this probe requires gradients for training."""
+        return self._requires_grad
+
+    @property
     def requires_sequences(self) -> bool:
         """Whether probe needs full sequences."""
         return self.sequence_pooling == SequencePooling.NONE

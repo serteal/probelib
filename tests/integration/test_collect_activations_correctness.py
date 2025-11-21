@@ -81,7 +81,7 @@ def test_collect_activations_matches_hidden_states_llama3():
     acts = collect_activations(
         model=model,
         tokenizer=tokenizer,
-        data=dialogues,
+        dataset=dialogues,
         layers=layers,
         batch_size=2,
         streaming=False,

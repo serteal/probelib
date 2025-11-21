@@ -12,6 +12,7 @@ import torch
 
 from probelib.probes import MLP, Attention, Logistic
 from probelib.processing.activations import ActivationIterator, Activations
+from probelib.processing import SequencePooling
 from probelib.types import Label
 
 
@@ -24,7 +25,7 @@ class TestAggregationEdgeCases:
         acts = torch.randn(1, 2, 10, 8)
         detection_mask = torch.zeros(2, 10)  # No valid tokens
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, 10),
             input_ids=torch.ones(2, 10, dtype=torch.long),
@@ -33,7 +34,7 @@ class TestAggregationEdgeCases:
         )
 
         # Mean aggregation with no valid tokens should handle gracefully
-        aggregated = activations.aggregate(method="mean")
+        aggregated = activations.select(layers=0).pool(dim="sequence", method="mean").activations
         assert aggregated.shape == (2, 8)
         # Should be zeros or handle gracefully
         assert torch.all(torch.isfinite(aggregated))
@@ -45,7 +46,7 @@ class TestAggregationEdgeCases:
         # Only first token valid for each sequence
         detection_mask[:, 0] = 1
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(3, 10),
             input_ids=torch.ones(3, 10, dtype=torch.long),
@@ -55,7 +56,7 @@ class TestAggregationEdgeCases:
 
         # Test all aggregation methods
         for method in ["mean", "max", "last_token"]:
-            aggregated = activations.aggregate(method=method)
+            aggregated = activations.select(layers=0).pool(dim="sequence", method=method).activations
             assert aggregated.shape == (3, 8)
 
             if method == "mean" or method == "last_token":
@@ -78,7 +79,7 @@ class TestAggregationEdgeCases:
         detection_mask[2, :15] = 1  # 15 valid tokens
         detection_mask[3, :20] = 1  # 20 valid tokens
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(batch_size, seq_len),
             input_ids=torch.ones(batch_size, seq_len, dtype=torch.long),
@@ -87,7 +88,7 @@ class TestAggregationEdgeCases:
         )
 
         # Test mean aggregation
-        mean_agg = activations.aggregate(method="mean")
+        mean_agg = activations.select(layers=0).pool(dim="sequence", method="mean").activations
         assert mean_agg.shape == (batch_size, d_model)
 
         # Verify mean is computed only over valid tokens
@@ -97,11 +98,11 @@ class TestAggregationEdgeCases:
             assert torch.allclose(mean_agg[i], expected_mean, atol=1e-6)
 
         # Test max aggregation
-        max_agg = activations.aggregate(method="max")
+        max_agg = activations.select(layers=0).pool(dim="sequence", method="max").activations
         assert max_agg.shape == (batch_size, d_model)
 
         # Test last_token aggregation
-        last_agg = activations.aggregate(method="last_token")
+        last_agg = activations.select(layers=0).pool(dim="sequence", method="last_token").activations
         assert last_agg.shape == (batch_size, d_model)
 
         # Last token should be at different positions
@@ -118,7 +119,7 @@ class TestAggregationEdgeCases:
 
         detection_mask = torch.ones(2, 10)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, 10),
             input_ids=torch.ones(2, 10, dtype=torch.long),
@@ -127,7 +128,7 @@ class TestAggregationEdgeCases:
         )
 
         # Mean aggregation should propagate NaN
-        mean_agg = activations.aggregate(method="mean")
+        mean_agg = activations.select(layers=0).pool(dim="sequence", method="mean").activations
         assert torch.any(torch.isnan(mean_agg[0]))
 
         # But shouldn't affect other sequences
@@ -139,7 +140,7 @@ class TestAggregationEdgeCases:
         for dtype in [torch.float32, torch.float64]:
             acts = torch.randn(1, 2, 10, 8, dtype=dtype)
 
-            activations = Activations(
+            activations = Activations.from_tensor(
                 activations=acts,
                 attention_mask=torch.ones(2, 10),
                 input_ids=torch.ones(2, 10, dtype=torch.long),
@@ -147,7 +148,7 @@ class TestAggregationEdgeCases:
                 layer_indices=[0],
             )
 
-            aggregated = activations.aggregate(method="mean")
+            aggregated = activations.select(layers=0).pool(dim="sequence", method="mean").activations
             assert aggregated.dtype == dtype
 
     def test_aggregation_preserves_device(self):
@@ -156,7 +157,7 @@ class TestAggregationEdgeCases:
 
         acts = torch.randn(1, 2, 10, 8, device=device)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, 10, device=device),
             input_ids=torch.ones(2, 10, dtype=torch.long, device=device),
@@ -164,7 +165,7 @@ class TestAggregationEdgeCases:
             layer_indices=[0],
         )
 
-        aggregated = activations.aggregate(method="mean")
+        aggregated = activations.select(layers=0).pool(dim="sequence", method="mean").activations
         assert aggregated.device.type == device
 
 
@@ -193,7 +194,7 @@ class TestStreamingEdgeCases:
         iterator = EmptyIterator()
 
         # Probe should handle empty iterator gracefully
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
 
         # This should not crash - but with empty labels, will fail earlier
         labels = []
@@ -204,12 +205,13 @@ class TestStreamingEdgeCases:
         """Test streaming with exactly one batch."""
         acts = torch.randn(1, 5, 10, 8)
 
-        batch = Activations(
+        batch = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(5, 10),
             input_ids=torch.ones(5, 10, dtype=torch.long),
             detection_mask=torch.ones(5, 10),
             layer_indices=[0],
+            batch_indices=torch.arange(5, dtype=torch.long),  # Add batch_indices
         )
 
         class SingleBatchIterator(ActivationIterator):
@@ -231,7 +233,7 @@ class TestStreamingEdgeCases:
         iterator = SingleBatchIterator(batch)
         labels = [Label.POSITIVE] * 3 + [Label.NEGATIVE] * 2
 
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
         probe.fit(iterator, labels)
 
         assert probe._fitted
@@ -240,28 +242,31 @@ class TestStreamingEdgeCases:
     def test_uneven_batch_sizes(self):
         """Test streaming with varying batch sizes."""
         # Create batches with different sizes
-        batch1 = Activations(
+        batch1 = Activations.from_tensor(
             activations=torch.randn(1, 10, 20, 16),
             attention_mask=torch.ones(10, 20),
             input_ids=torch.ones(10, 20, dtype=torch.long),
             detection_mask=torch.ones(10, 20),
             layer_indices=[0],
+            batch_indices=torch.arange(0, 10, dtype=torch.long),
         )
 
-        batch2 = Activations(
+        batch2 = Activations.from_tensor(
             activations=torch.randn(1, 5, 20, 16),
             attention_mask=torch.ones(5, 20),
             input_ids=torch.ones(5, 20, dtype=torch.long),
             detection_mask=torch.ones(5, 20),
             layer_indices=[0],
+            batch_indices=torch.arange(10, 15, dtype=torch.long),
         )
 
-        batch3 = Activations(
+        batch3 = Activations.from_tensor(
             activations=torch.randn(1, 3, 20, 16),
             attention_mask=torch.ones(3, 20),
             input_ids=torch.ones(3, 20, dtype=torch.long),
             detection_mask=torch.ones(3, 20),
             layer_indices=[0],
+            batch_indices=torch.arange(15, 18, dtype=torch.long),
         )
 
         class UnevenIterator(ActivationIterator):
@@ -283,7 +288,7 @@ class TestStreamingEdgeCases:
         iterator = UnevenIterator()
         labels = [Label.POSITIVE] * 9 + [Label.NEGATIVE] * 9  # 18 total
 
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
         probe.fit(iterator, labels)
 
         assert probe._fitted
@@ -304,14 +309,16 @@ class TestStreamingEdgeCases:
                 self._num_batches = n_batches
 
             def __iter__(self):
-                for _ in range(self.n_batches):
+                for i in range(self.n_batches):
                     # Create a large batch
-                    batch = Activations(
+                    start_idx = i * self.batch_size
+                    batch = Activations.from_tensor(
                         activations=torch.randn(1, self.batch_size, 100, 512),
                         attention_mask=torch.ones(self.batch_size, 100),
                         input_ids=torch.ones(self.batch_size, 100, dtype=torch.long),
                         detection_mask=torch.ones(self.batch_size, 100),
                         layer_indices=[0],
+                        batch_indices=torch.arange(start_idx, start_idx + self.batch_size, dtype=torch.long),
                     )
                     yield batch
                     # Force garbage collection to ensure memory is freed
@@ -327,7 +334,7 @@ class TestStreamingEdgeCases:
         iterator = MemoryTrackingIterator(n_batches=5, batch_size=50)
         labels = [Label.POSITIVE] * 125 + [Label.NEGATIVE] * 125  # 250 total
 
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
 
         # This should complete without memory issues
         probe.fit(iterator, labels)
@@ -341,7 +348,7 @@ class TestProbeEdgeCases:
         """Test probe training with just one sample."""
         acts = torch.randn(1, 1, 10, 8)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(1, 10),
             input_ids=torch.ones(1, 10, dtype=torch.long),
@@ -350,7 +357,7 @@ class TestProbeEdgeCases:
         )
 
         # Can't train with single class - PyTorch implementation may not raise
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
 
         # Try to fit with single sample - may not raise in PyTorch implementation
         try:
@@ -368,7 +375,7 @@ class TestProbeEdgeCases:
         n_samples = 100
         acts = torch.randn(1, n_samples, 10, 8)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(n_samples, 10),
             input_ids=torch.ones(n_samples, 10, dtype=torch.long),
@@ -379,7 +386,7 @@ class TestProbeEdgeCases:
         # 99 positive, 1 negative
         labels = [Label.POSITIVE] * 99 + [Label.NEGATIVE] * 1
 
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
         probe.fit(activations, labels)
 
         # Should still train, but might have poor performance
@@ -392,7 +399,7 @@ class TestProbeEdgeCases:
         """Test probe when requested layer doesn't exist."""
         acts = torch.randn(2, 10, 20, 16)  # 2 layers
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(10, 20),
             input_ids=torch.ones(10, 20, dtype=torch.long),
@@ -401,18 +408,18 @@ class TestProbeEdgeCases:
         )
 
         # Request non-existent layer 5
-        probe = Logistic(layer=5, sequence_aggregation="mean")
+        probe = Logistic(layer=5, sequence_pooling=SequencePooling.MEAN)
 
         labels = [Label.POSITIVE] * 5 + [Label.NEGATIVE] * 5
 
-        with pytest.raises(ValueError, match="Layer 5 not found"):
+        with pytest.raises(ValueError, match="Layer 5 is not available"):
             probe.fit(activations, labels)
 
     def test_probe_with_all_zero_features(self):
         """Test probe when all features are zero."""
         acts = torch.zeros(1, 10, 20, 16)  # All zeros
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(10, 20),
             input_ids=torch.ones(10, 20, dtype=torch.long),
@@ -422,7 +429,7 @@ class TestProbeEdgeCases:
 
         labels = [Label.POSITIVE] * 5 + [Label.NEGATIVE] * 5
 
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
         probe.fit(activations, labels)
 
         # Should still train, but predictions might be uniform
@@ -437,7 +444,7 @@ class TestProbeEdgeCases:
         """Test MLP probe specific edge cases."""
         acts = torch.randn(1, 10, 20, 16)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(10, 20),
             input_ids=torch.ones(10, 20, dtype=torch.long),
@@ -448,17 +455,17 @@ class TestProbeEdgeCases:
         labels = [Label.POSITIVE] * 5 + [Label.NEGATIVE] * 5
 
         # Test with very small hidden dimension
-        probe = MLP(layer=0, hidden_dim=1, sequence_aggregation="mean")
+        probe = MLP(layer=0, hidden_dim=1, sequence_pooling=SequencePooling.MEAN)
         probe.fit(activations, labels)
         assert probe._fitted
 
         # Test with very large hidden dimension
-        probe = MLP(layer=0, hidden_dim=1024, sequence_aggregation="mean")
+        probe = MLP(layer=0, hidden_dim=1024, sequence_pooling=SequencePooling.MEAN)
         probe.fit(activations, labels)
         assert probe._fitted
 
         # Test with high dropout
-        probe = MLP(layer=0, dropout=0.9, sequence_aggregation="mean")
+        probe = MLP(layer=0, dropout=0.9, sequence_pooling=SequencePooling.MEAN)
         probe.fit(activations, labels)
         assert probe._fitted
 
@@ -466,7 +473,7 @@ class TestProbeEdgeCases:
         """Test Attention probe specific edge cases."""
         acts = torch.randn(1, 10, 20, 16)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(10, 20),
             input_ids=torch.ones(10, 20, dtype=torch.long),
@@ -495,7 +502,7 @@ class TestBoundaryConditions:
         max_seq_len = 4096
         acts = torch.randn(1, 2, max_seq_len, 16)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, max_seq_len),
             input_ids=torch.ones(2, max_seq_len, dtype=torch.long),
@@ -504,7 +511,7 @@ class TestBoundaryConditions:
         )
 
         # Should handle long sequences
-        aggregated = activations.aggregate(method="mean")
+        aggregated = activations.select(layers=0).pool(dim="sequence", method="mean").activations
         assert aggregated.shape == (2, 16)
 
     def test_many_layers(self):
@@ -512,7 +519,7 @@ class TestBoundaryConditions:
         n_layers = 100
         acts = torch.randn(n_layers, 2, 10, 16)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, 10),
             input_ids=torch.ones(2, 10, dtype=torch.long),
@@ -521,7 +528,7 @@ class TestBoundaryConditions:
         )
 
         # Should handle many layers
-        filtered = activations.filter_layers([0, 50, 99])
+        filtered = activations.select(layers=[0, 50, 99])
         assert filtered.n_layers == 3
 
     def test_high_dimensional_embeddings(self):
@@ -529,7 +536,7 @@ class TestBoundaryConditions:
         d_model = 8192
         acts = torch.randn(1, 2, 10, d_model)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(2, 10),
             input_ids=torch.ones(2, 10, dtype=torch.long),
@@ -540,7 +547,7 @@ class TestBoundaryConditions:
         labels = [Label.POSITIVE, Label.NEGATIVE]
 
         # Should handle high dimensions (might be slow)
-        probe = Logistic(layer=0, sequence_aggregation="mean")
+        probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
         probe.fit(activations, labels)
         assert probe._fitted
         # Check network was created with correct input dimension
@@ -552,7 +559,7 @@ class TestBoundaryConditions:
         """Test training multiple probes concurrently (not parallel)."""
         acts = torch.randn(3, 10, 20, 16)  # 3 layers
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(10, 20),
             input_ids=torch.ones(10, 20, dtype=torch.long),
@@ -565,7 +572,7 @@ class TestBoundaryConditions:
         # Train probes on different layers
         probes = []
         for layer in [0, 1, 2]:
-            probe = Logistic(layer=layer, sequence_aggregation="mean")
+            probe = Logistic(layer=layer, sequence_pooling=SequencePooling.MEAN)
             probe.fit(activations, labels)
             probes.append(probe)
 
@@ -581,7 +588,7 @@ class TestBoundaryConditions:
         """Test saving and loading probes in edge cases."""
         acts = torch.randn(1, 10, 20, 16)
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=acts,
             attention_mask=torch.ones(10, 20),
             input_ids=torch.ones(10, 20, dtype=torch.long),
@@ -595,7 +602,7 @@ class TestBoundaryConditions:
             # Test with special characters in path
             save_path = Path(tmpdir) / "probe with spaces & symbols!.pt"
 
-            probe = Logistic(layer=0, sequence_aggregation="mean")
+            probe = Logistic(layer=0, sequence_pooling=SequencePooling.MEAN)
             probe.fit(activations, labels)
             probe.save(save_path)
 
@@ -603,7 +610,7 @@ class TestBoundaryConditions:
             assert loaded._fitted
 
             # Test overwriting existing file
-            probe2 = MLP(layer=0, sequence_aggregation="mean")
+            probe2 = MLP(layer=0, sequence_pooling=SequencePooling.MEAN)
             probe2.fit(activations, labels)
             probe2.save(save_path)  # Should overwrite
 

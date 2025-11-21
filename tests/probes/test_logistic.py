@@ -19,7 +19,28 @@ class MockActivationIterator(ActivationIterator):
     """Mock iterator for testing."""
 
     def __init__(self, batches):
-        self.batches = batches
+        # Add batch_indices to each batch if not present
+        self.batches = []
+        start_idx = 0
+        for batch in batches:
+            if batch.batch_indices is None:
+                # Create batch indices for this batch
+                batch_size = batch.batch_size
+                indices = torch.arange(start_idx, start_idx + batch_size, dtype=torch.long)
+                # Create new batch with indices
+                from probelib.processing.activations import Axis
+                new_batch = Activations.from_tensor(
+                    activations=batch.activations,
+                    layer_indices=batch.layer_indices,
+                    attention_mask=batch.attention_mask,
+                    detection_mask=batch.detection_mask,
+                    input_ids=batch.input_ids,
+                    batch_indices=indices,
+                )
+                self.batches.append(new_batch)
+                start_idx += batch_size
+            else:
+                self.batches.append(batch)
         self._layers = [0]  # Single layer
 
     def __iter__(self):
@@ -47,7 +68,7 @@ def create_test_activations(n_samples=10, seq_len=20, d_model=16, layer=0):
         valid_len = 5 + i % 10
         detection_mask[i, :valid_len] = 1
 
-    return Activations(
+    return Activations.from_tensor(
         activations=acts,
         attention_mask=torch.ones(n_samples, seq_len),
         input_ids=torch.ones(n_samples, seq_len, dtype=torch.long),
@@ -75,7 +96,7 @@ def create_separable_data(n_samples=20, seq_len=10, d_model=8, layer=0):
 
     detection_mask = torch.ones(n_samples, seq_len)
 
-    activations = Activations(
+    activations = Activations.from_tensor(
         activations=acts,
         attention_mask=torch.ones(n_samples, seq_len),
         input_ids=torch.ones(n_samples, seq_len, dtype=torch.long),
@@ -97,7 +118,7 @@ class TestLogistic:
         probe = Logistic(
             layer=5,
             sequence_pooling=SequencePooling.MEAN,
-            l2_penalty=0.1,
+            C=10.0,  # C is inverse of l2_penalty (C=10 ≈ l2_penalty=0.1)
             device="cpu",
             random_state=42,
             verbose=False,
@@ -106,7 +127,7 @@ class TestLogistic:
         assert probe.layer == 5
         assert probe.sequence_pooling == SequencePooling.MEAN
         # score_aggregation no longer exists
-        assert probe.l2_penalty == 0.1
+        assert probe.C == 10.0
         assert probe.device == "cpu"
         assert probe.random_state == 42
         assert probe._fitted is False
@@ -259,7 +280,7 @@ class TestLogistic:
         probe = Logistic(
             layer=0,  # Match the layer in test data
             sequence_pooling=SequencePooling.MAX,
-            l2_penalty=0.5,
+            C=2.0,  # C=2.0 ≈ l2_penalty=0.5
             device="cpu",
             random_state=42,
         )
@@ -279,11 +300,12 @@ class TestLogistic:
             assert loaded_probe.layer == 0
             assert loaded_probe.sequence_pooling == SequencePooling.MAX
             # score_aggregation no longer exists
-            assert loaded_probe.l2_penalty == 0.5
+            assert loaded_probe.C == 2.0
             assert loaded_probe._fitted is True
 
-            # Check predictions are the same
+            # Check predictions are the same (move to same device if needed)
             probs_after = loaded_probe.predict_proba(activations)
+            probs_before = probs_before.to(probs_after.device)
             assert torch.allclose(probs_before, probs_after, atol=1e-6)
 
     def test_save_unfitted_probe(self):
@@ -320,7 +342,7 @@ class TestLogistic:
 
         # Test with wrong layer
         probe = Logistic(layer=5, sequence_pooling=SequencePooling.MEAN, device="cpu")
-        with pytest.raises(ValueError, match="Layer 5 not found"):
+        with pytest.raises(ValueError, match="Layer 5 is not available"):
             probe.fit(activations, [Label.POSITIVE] * 5 + [Label.NEGATIVE] * 5)
 
     def test_partial_fit_after_fit(self):

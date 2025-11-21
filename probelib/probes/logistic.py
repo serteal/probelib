@@ -143,6 +143,7 @@ class Logistic(BaseProbe):
         self._streaming_n_seen = 0  # Total samples seen in streaming mode
         self._scaler_frozen = False  # Freeze scaler after first epoch
         self._n_epochs = 100  # Default number of epochs for streaming
+        self._t = 0  # Step counter for partial_fit
 
         # This probe requires gradients
         self._requires_grad = True
@@ -371,7 +372,8 @@ class Logistic(BaseProbe):
         labels = labels.to(self.device).float()  # Labels should be float for BCE loss
 
         # Initialize network on first batch (use AdamW for streaming)
-        if self._network is None:
+        # If fit() was called before partial_fit(), we need to reinitialize with AdamW
+        if self._network is None or self._use_lbfgs:
             # Use stored n_epochs if available, otherwise default to 100
             n_epochs = getattr(self, "_current_n_epochs", 100)
             self._init_network(

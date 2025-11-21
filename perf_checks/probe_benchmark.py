@@ -75,7 +75,7 @@ def benchmark_activation_collection(
         return pl.collect_activations(
             model=model,
             tokenizer=tokenizer,
-            data=dataset,
+            dataset=dataset,
             layers=layers,
             batch_size=batch_size,
             streaming=False,  # Use batch mode for fair comparison
@@ -96,7 +96,7 @@ def benchmark_activation_collection(
         activation_iter = pl.collect_activations(
             model=model,
             tokenizer=tokenizer,
-            data=dataset,
+            dataset=dataset,
             layers=layers,
             batch_size=batch_size,
             streaming=True,  # Force streaming mode
@@ -146,8 +146,7 @@ def benchmark_probe_training(
                 probes=probe,
                 model=model,
                 tokenizer=tokenizer,
-                data=dataset,
-                labels=dataset.labels,
+                dataset=dataset,
                 batch_size=batch_size,
                 streaming=True,
                 verbose=False,
@@ -214,8 +213,7 @@ def benchmark_probe_training(
             probes=probes,
             model=model,
             tokenizer=tokenizer,
-            data=dataset,
-            labels=dataset.labels,
+            dataset=dataset,
             batch_size=batch_size,
             streaming=True,
             verbose=False,

@@ -16,7 +16,7 @@ def create_test_activations(n_samples=10, seq_len=20, d_model=16, layer=0):
     acts = torch.randn(1, n_samples, seq_len, d_model)
     detection_mask = torch.ones(n_samples, seq_len)
 
-    return Activations(
+    return Activations.from_tensor(
         activations=acts,
         attention_mask=torch.ones(n_samples, seq_len),
         input_ids=torch.ones(n_samples, seq_len, dtype=torch.long),
@@ -45,7 +45,7 @@ def create_separable_data(n_samples=20, seq_len=10, d_model=8, layer=0):
         # Noise elsewhere
         acts[0, i, :-3, :] = torch.randn(seq_len - 3, d_model) * 0.1
 
-    activations = Activations(
+    activations = Activations.from_tensor(
         activations=acts,
         attention_mask=torch.ones(n_samples, seq_len),
         input_ids=torch.ones(n_samples, seq_len, dtype=torch.long),

@@ -23,7 +23,7 @@ class TestEmptyBatchHandling:
         d_model = 768
 
         # Create activations where detection_mask is all False
-        return Activations(
+        return Activations.from_tensor(
             activations=torch.randn(1, batch_size, seq_len, d_model),
             attention_mask=torch.ones(batch_size, seq_len),
             input_ids=torch.randint(0, 1000, (batch_size, seq_len)),
@@ -45,7 +45,7 @@ class TestEmptyBatchHandling:
         detection_mask[0, 10:20] = True  # 10 detected tokens in first sample
         detection_mask[1, 5:15] = True  # 10 detected tokens in second sample
 
-        return Activations(
+        return Activations.from_tensor(
             activations=torch.randn(1, batch_size, seq_len, d_model),
             attention_mask=torch.ones(batch_size, seq_len),
             input_ids=torch.randint(0, 1000, (batch_size, seq_len)),
@@ -137,7 +137,7 @@ class TestEmptyBatchHandling:
         # Second sample has NO tokens (all False)
         detection_mask[2, 5:10] = True  # Third sample has tokens
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=torch.randn(1, batch_size, seq_len, d_model),
             attention_mask=torch.ones(batch_size, seq_len),
             input_ids=torch.randint(0, 1000, (batch_size, seq_len)),
@@ -166,7 +166,7 @@ class TestEmptyBatchHandling:
         # Second sample has NO tokens
         detection_mask[2, 5:10] = True  # Third sample has tokens
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=torch.randn(1, batch_size, seq_len, d_model),
             attention_mask=torch.ones(batch_size, seq_len),
             input_ids=torch.randint(0, 1000, (batch_size, seq_len)),
@@ -222,7 +222,7 @@ class TestStreamingWorkflow:
         batch_size, seq_len = tokenized["input_ids"].shape
         d_model = 768
 
-        activations = Activations(
+        activations = Activations.from_tensor(
             activations=torch.randn(1, batch_size, seq_len, d_model),
             attention_mask=tokenized["attention_mask"],
             input_ids=tokenized["input_ids"],

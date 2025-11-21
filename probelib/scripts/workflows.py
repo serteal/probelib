@@ -132,6 +132,7 @@ def train_probes(
         )
 
     # 5. Collect activations once for all layers
+    # Note: Detach activations by default for probe training to avoid gradient issues
     activations = collect_activations(
         model=model,
         tokenizer=tokenizer,
@@ -142,6 +143,7 @@ def train_probes(
         streaming=streaming,
         verbose=verbose,
         collection_strategy=collection_strategy,
+        detach_activations=activation_kwargs.pop("detach_activations", True),
         **activation_kwargs,
     )
 
@@ -303,6 +305,7 @@ def evaluate_probes(
         )
 
     # 6. Collect activations
+    # Note: Detach activations by default for probe evaluation to avoid gradient issues
     activations = collect_activations(
         model=model,
         tokenizer=tokenizer,
@@ -313,6 +316,7 @@ def evaluate_probes(
         streaming=streaming,
         verbose=verbose,
         collection_strategy=collection_strategy,
+        detach_activations=activation_kwargs.pop("detach_activations", True),
         **activation_kwargs,
     )
 
