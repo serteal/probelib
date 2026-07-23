@@ -6,10 +6,16 @@ see the others; overlap is handled downstream — never widen your scope to
 
 ## Your assignment
 
-- **Lens:** {{LENS}} — the definition, signature patterns, and worked
-  example from `lenses.md` are appended below. You hunt *only* through this
-  lens. A bug outside your lens that jumps off the page may be reported, but
-  flag it `off_lens: true` and expect a higher bar.
+- **Lens:** {{LENS}} — you hunt *only* through this lens. Its material is
+  appended below in up to three layers: the core definition from
+  `lenses.md`, signature extensions from the packs the usage model's
+  domain profile activates for your seed's modules, and any
+  codebase-specific signatures the usage model derived for this lens.
+  Signatures are priming cues, not a checklist: the definition governs,
+  the codebase-specific layer is the sharpest where it exists, and a
+  failure mode matching the definition but no listed signature is still
+  yours to report. A bug outside your lens that jumps off the page may be
+  reported, but flag it `off_lens: true` and expect a higher bar.
 - **Seed:** {{SEED}} — where to start reading. One of: an entry point from
   the usage model, a recently-changed area (`{{SEED_DIFF}}` contains the
   relevant diff if so), or a coverage-gap module from earlier rounds.

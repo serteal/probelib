@@ -69,6 +69,21 @@ check them.
    sharp edges, accuracy trade-offs). This list prevents false positives;
    be thorough but only include what is actually documented or stated —
    citing where.
+9. **Domain profile & failure signatures** — the layer that specializes
+   the otherwise domain-neutral hunting prompts to *this* codebase:
+   - Declare which signature packs (`packs/*.md`, listed in
+     `{{AVAILABLE_PACKS}}`) apply. Tag per-module where the codebase
+     mixes domains — a research core with engineering glue around it
+     should get `ml-research` on the core and `engineering` on the CLI
+     and infra scripts, not one label for everything.
+   - Derive {{N_SIGNATURES|5-15}} **codebase-specific failure
+     signatures** from the invariants and data flows you just documented:
+     for an invariant "X must hold", the signature is the concrete way
+     this code would most plausibly violate it, stated so a hypothesis
+     agent can hunt for it ("mask constructed in A, consumed in B — any
+     reordering between them breaks alignment"). Each cites the invariant
+     or code path it derives from. Do not invent signatures with no
+     grounding in the code; an empty-ish list is better than a padded one.
 
 ## Constraints
 

@@ -39,26 +39,27 @@ results outrank a loud crash: a crash announces itself, a wrong number
 ends up in a paper.
 
 - **critical** — mainline usage silently produces wrong results or loses
-  data; any experiment or downstream decision that touched this path is
-  suspect. *Anchor: pooled activations averaged with padding included —
-  every probe score biased, no error, affects the default path.*
+  data; any experiment, decision, or artifact that touched this path is
+  suspect. *Anchor: an aggregation on the default path weights entries
+  incorrectly — every output is wrong, no error is ever raised.*
 - **high** — wrong results on a common non-default path; or a mainline
   workflow fails with no workaround / a failure confusing enough to cost
-  hours. *Anchor: stratified split silently falls back to unstratified
-  when a class is rare — misleading eval for the subset of users who pass
-  `stratified=True` on skewed data.*
+  hours. *Anchor: a documented mode silently degrades to a weaker
+  behavior for the subset of users who opted into it.*
 - **medium** — incorrect behavior on edges realistic usage occasionally
   hits; contract violations with a workaround; errors that mislead about
-  the actual cause. *Anchor: save→load drops a non-default dtype, only
-  users who changed dtype and reload probes notice, and predictions make
-  it obvious something is off.*
+  the actual cause. *Anchor: a saved artifact reloads with one
+  non-default setting reset — only users who changed it notice, and the
+  divergence is visible when it happens.*
 - **low** — real but rarely reached per the usage model; cosmetic
-  wrongness; doc drift on a seldom-used parameter. *Anchor: `__repr__`
-  shows the pre-normalization layer index.*
+  wrongness; doc drift on a seldom-used parameter. *Anchor: a status
+  display shows a stale value with no downstream use.*
 
-Replace the anchors with `{{CODEBASE_ANCHORS}}` once the ledger has real
-confirmed examples from this codebase — codebase-native anchors calibrate
-better than generic ones.
+Sharper anchors override these defaults when provided:
+`{{PACK_ANCHORS}}` (from the domain packs the usage model activated) and,
+above those, `{{CODEBASE_ANCHORS}}` — real confirmed findings from this
+codebase's ledger. Codebase-native anchors calibrate best; prefer the
+sharpest layer available.
 
 ### 3. Consistency pass
 

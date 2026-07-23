@@ -12,10 +12,11 @@ run). Your output is consumed by other agents and, eventually, by the owner.
 In priority order:
 
 1. **Silently wrong results.** The code runs and returns something, but the
-   something is wrong: a reduction over the wrong axis, a train/test split
-   that leaks, a mask misaligned with tokens, a cache serving stale data, a
-   config value read but never applied. This is the worst class — it can
-   invalidate research conclusions without leaving a trace.
+   something is wrong: an aggregation weighted incorrectly, a train/test
+   split that leaks, a timezone conversion applied twice, a cache serving
+   stale data, a config value read but never applied. This is the worst
+   class — it can invalidate research conclusions or quietly corrupt a
+   tool's output without leaving a trace.
 2. **Failures on realistic usage.** Crashes, hangs, or data loss on inputs
    and workflows that the usage model says actually occur.
 3. **Contract violations.** A docstring, README, type hint, or example
