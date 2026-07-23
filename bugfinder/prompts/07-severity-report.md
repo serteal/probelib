@@ -55,11 +55,9 @@ ends up in a paper.
   wrongness; doc drift on a seldom-used parameter. *Anchor: a status
   display shows a stale value with no downstream use.*
 
-Sharper anchors override these defaults when provided:
-`{{PACK_ANCHORS}}` (from the domain packs the usage model activated) and,
-above those, `{{CODEBASE_ANCHORS}}` — real confirmed findings from this
-codebase's ledger. Codebase-native anchors calibrate best; prefer the
-sharpest layer available.
+When `{{CODEBASE_ANCHORS}}` is provided — real confirmed findings from
+this codebase's ledger with their settled severities — it overrides these
+generic defaults: codebase-native anchors calibrate best.
 
 ### 3. Consistency pass
 
@@ -88,8 +86,8 @@ For the owner, front-loaded:
 5. **Refuted this round** — one line each with the reason. This section
    builds trust in the pipeline and is the owner's chance to catch a wrong
    refutation.
-6. **Pipeline notes** — coverage this round, lens hit-rates, suggested
-   seeds/lenses for next round, usage-model staleness flags.
+6. **Pipeline notes** — coverage this round, method/area hit-rates,
+   which focus questions paid off, usage-model staleness flags.
 
 ### 5. Emit ledger updates
 
@@ -102,7 +100,8 @@ For the owner, front-loaded:
     {"id": "bf-2026-0151", "action": "set_status", "status": "refuted",
      "refutation_reason": "caller-validates", "note": "<verifier's ledger_note>"}
   ],
-  "next_round_hints": {"seeds": ["..."], "lens_weights": {"numeric-shape": 1.3}}
+  "next_round_hints": {"seeds": ["..."], "method_weights": {"invariant-attack": 1.3},
+                       "focus_suggestions": ["<questions this round's evidence raises>"]}
 }
 ```
 

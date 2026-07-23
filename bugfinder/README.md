@@ -18,22 +18,28 @@ the orchestrator fills in at spawn time.
              │  01-usage-model  →  02-usage-model-review      │
              └────────────────────────┬───────────────────────┘
                                       │ usage-model.md
+             ┌────────────────────────▼───────────────────────┐
+             │ Phase 1: PLAN ROUND (03-round-planner)         │
+             │  usage model + ledger + churn + coverage map   │
+             │  → N investigation briefs, pairwise-           │
+             │    decorrelated (seed × method × question)     │
+             └────────────────────────┬───────────────────────┘
         ┌─────────────────────────────┼─────────────────────────────┐
         ▼                             ▼                             ▼
-  Phase 1: HYPOTHESIS fanout (03-hypothesis × N, lens × seed matrix)
+  Phase 2: HYPOTHESIS fanout (04-hypothesis × N, one brief each)
         │                             │                             │
         └─────────────┬───────────────┴─────────────────────────────┘
                       ▼ findings.json (≤5 each, structured)
-             Phase 2: DEDUP + TRIAGE (04-dedup-triage, 1 agent,
+             Phase 3: DEDUP + TRIAGE (05-dedup-triage, 1 agent,
                       mechanical fingerprint clustering first)
                       ▼ top-K merged findings
         ┌─────────────┼─────────────┐
         ▼             ▼             ▼
-  Phase 3: VERIFY (05-verify × K, one finding each, adversarial,
+  Phase 4: VERIFY (06-verify × K, one finding each, adversarial,
                    executable repro against the real package)
         └─────────────┬─────────────┘
                       ▼ verified reports (confirmed AND refuted)
-             Phase 4: CALIBRATE + REPORT (06-severity-report)
+             Phase 5: CALIBRATE + REPORT (07-severity-report)
                       ▼
              digest for the owner  +  ledger updates
                       │
@@ -60,15 +66,18 @@ shape. The changes below are where the sketch would underperform:
    cite instead of their own intuition). Refresh it incrementally when git
    churn touches uncharted areas; don't regenerate from scratch each round.
 
-2. **Hypothesis diversity comes from lenses × seeds, not just "different
-   starting files".** Different files give shallow diversity — every agent
-   still hunts for the same kinds of bugs. Each agent gets one *lens* (a
-   failure-mode class from `lenses.md`) and one *seed* (an entry point, a
-   recently-churned area, or an uncovered module). Churn seeding matters:
+2. **Hypothesis diversity is planned per round, not hardcoded.** Different
+   starting files alone give shallow diversity — every agent still
+   gravitates to the same salient code and the same salient bug types. A
+   *round planner* (`03`) turns the usage model, ledger, git churn, and
+   coverage history into N pairwise-decorrelated *investigation briefs*:
+   seed (where to start) × method (how to explore, from a domain-neutral
+   catalog of procedures) × focus question (what to ask, codebase-specific,
+   derived from invariants and failure signatures). Churn seeding matters:
    bugs correlate with recent change, and "variant analysis" from a recent
-   diff is the regime where LLM bug-finding has actually worked in the wild.
-   Lens material is layered to stay domain-general — see "Lens layering"
-   below.
+   diff is the regime where LLM bug-finding has actually worked in the
+   wild. See "Focus without a bug taxonomy" below for why briefs replaced
+   bug-type lenses.
 
 3. **Findings are structured, capped, and self-refuted at the source.** Most
    FP reduction is cheapest at generation time: every finding must carry
@@ -125,40 +134,55 @@ shape. The changes below are where the sketch would underperform:
 
 8. **Rounds, not a hot loop.** Run in rounds; after `D` consecutive rounds
    with no new confirmed findings, sleep until new commits arrive, then wake
-   and seed hypothesis agents from the diff. Track per-lens confirmed vs
-   refuted rates over time and prune (or reduce budget for) lenses that only
-   produce noise on this codebase.
+   and seed the planner from the diff. Track per-method and per-area
+   confirmed vs refuted rates over time; the planner shifts budget away
+   from whatever only produces noise on this codebase.
 
 9. **Spend the strong model where it pays.** Hypothesis agents parallelize
    well on a cheaper/faster model tier; verification and final calibration
    are the precision bottleneck and deserve the strongest model and the most
    reasoning effort. Dedup clustering is mostly mechanical.
 
-## Lens layering: one prompt set for research *and* engineering codebases
+## Focus without a bug taxonomy
 
-Concrete failure signatures are a large part of what makes hypothesis
-agents effective — "look for state bugs" underperforms a primed checklist.
-But hardcoding one domain's signatures (tensor axes, train/test splits)
-into the shared prompts would misfire on a CLI tool, and vice versa. So
-signatures live in three layers, from most portable to sharpest:
+Hypothesis agents need two things: *decorrelation* (so N agents don't all
+converge on the same salient code) and *focus* (so each goes deep). An
+earlier iteration got both from assigned bug-type lenses with per-domain
+signature packs — but that hardcodes one domain's failure taxonomy into
+supposedly general prompts (every new domain needs a new pack), and a
+per-agent bug-type assignment quietly pressures agents to produce
+lens-shaped findings: an agent sent hunting "ordering bugs" in a codebase
+with none is tempted to stretch. So focus is procedural and generated
+instead, along three axes, none of which is a bug-type list:
 
-1. **Core lenses** (`prompts/lenses.md`) — ten failure modes defined
-   domain-neutrally (wrong-math, data-alignment, state-staleness, …).
-   Every codebase can compute a wrong number or swallow an error.
-2. **Domain packs** (`prompts/packs/`) — per-lens signature extensions and
-   severity anchors for a domain: `ml-research`, `engineering`, add more
-   as needed. The usage model's domain profile declares which apply —
-   *per module*, because real codebases mix domains (a research core with
-   engineering glue: the core gets `ml-research`, the scripts get
-   `engineering`).
-3. **Codebase-specific signatures** — generated by the usage-model phase
-   from this repo's own invariants ("mask built in A, consumed in B — any
-   reordering between them breaks alignment"), vetted by the review
-   agent. The sharpest layer, and the only truly per-codebase one.
+1. **Seeds** (*where*): entry points, churned areas, coverage gaps,
+   high-fan-in utilities, invariants — inventoried fresh each round.
+2. **Methods** (*how*, `prompts/methods.md`): exploration procedures —
+   trace a workflow end-to-end, attack an invariant, audit a module's
+   contracts, review recent diffs, check all callers of a utility, probe
+   test gaps, follow the README with fresh eyes, sweep boundaries.
+   Procedures are domain-neutral by construction: "does what flows out
+   match what the next step assumes?" works identically on tensors and
+   on CSV rows.
+3. **Focus questions** (*what*): concrete, codebase-specific questions
+   the planner derives from the usage model's invariants and failure
+   signatures, churn, and hit-rate history. A question can be answered
+   "it holds — here's what I checked", which a lens assignment never
+   gracefully could; cleared ground is recorded and not re-plowed.
 
-Signatures at every layer are priming cues, not a checklist: the lens
-definition governs, and hypothesis agents are told a match on a signature
-is not yet a finding, nor is the absence of one clearance.
+What carries the domain priors instead of packs: the usage model's
+invariants and generated failure signatures (per-codebase, vetted by the
+review agent), and the `invariant-attack` method, which aims agents at
+exactly the silent-wrongness properties worth defending. The planner is
+also told to vary the failure classes its questions implicitly point at
+(wrong values, stale state, contract drift, edge handling, swallowed
+errors) — portfolio balance, never per-agent quotas.
+
+Known trade-off: the planner is a single point of correlation — a dull
+planner makes a dull round. Mitigations: hard pairwise-decorrelation
+constraints in its prompt, past briefs and coverage in its input so
+repetition is visible, and per-method/area hit-rate feedback. If rounds
+still homogenize, interleave two planner variants.
 
 ## What counts as a bug (scope, in one place)
 
@@ -201,10 +225,10 @@ Status lifecycle: `open → confirmed → reported → fixed|intended`, or
 ## Per-round orchestration sketch
 
 1. Refresh usage model if churn touched modules it doesn't cover (else skip).
-2. Build the round plan: lenses × seeds matrix (~8–16 hypothesis agents;
-   weight seeds by churn and by coverage gaps from previous rounds' coverage
-   notes).
-3. Run hypothesis fanout → collect findings JSON.
+2. Run the round planner with churn, ledger, hit rates, and the coverage
+   map → ~8–16 investigation briefs.
+3. Run hypothesis fanout (one brief each) → collect findings JSON and
+   focus-question answers (the answers go into the coverage map).
 4. Mechanical fingerprint clustering → dedup/triage agent → top-K.
 5. Verify fanout (one agent per finding, sandboxed, time-budgeted).
 6. Calibration agent → digest + ledger updates.
@@ -218,13 +242,12 @@ Status lifecycle: `open → confirmed → reported → fixed|intended`, or
 | `prompts/00-common.md` | Shared preamble prepended to every agent prompt | — |
 | `prompts/01-usage-model.md` | Build the usage model document | 1, on setup + refresh |
 | `prompts/02-usage-model-review.md` | Adversarial check of the usage model | 1, after 01 |
-| `prompts/03-hypothesis.md` | Find candidate bugs through one lens from one seed | N per round |
-| `prompts/lenses.md` | Core (domain-neutral) lens definitions consumed by 03 | — |
-| `prompts/packs/ml-research.md` | ML/research signature extensions + anchors | activated by usage model |
-| `prompts/packs/engineering.md` | Tooling/services signature extensions + anchors | activated by usage model |
-| `prompts/04-dedup-triage.md` | Merge duplicates, apply ledger, rank, select top-K | 1 per round |
-| `prompts/05-verify.md` | Adversarially verify + reproduce one finding | K per round |
-| `prompts/06-severity-report.md` | Final gate, calibrated severity, owner digest | 1 per round |
+| `prompts/03-round-planner.md` | Turn usage model + ledger + churn + coverage into N decorrelated briefs | 1 per round |
+| `prompts/methods.md` | Exploration-method catalog (domain-neutral procedures) consumed by 03/04 | — |
+| `prompts/04-hypothesis.md` | Execute one brief: explore, hypothesize, self-refute | N per round |
+| `prompts/05-dedup-triage.md` | Merge duplicates, apply ledger, rank, select top-K | 1 per round |
+| `prompts/06-verify.md` | Adversarially verify + reproduce one finding | K per round |
+| `prompts/07-severity-report.md` | Final gate, calibrated severity, owner digest | 1 per round |
 
 ## References
 
@@ -248,8 +271,9 @@ Status lifecycle: `open → confirmed → reported → fixed|intended`, or
   primitive.
 - Tambon et al., "Silent bugs in deep learning frameworks" (EMSE 2023,
   arXiv:2112.13314) and "Investigating and Detecting Silent Bugs in PyTorch
-  Programs" (SANER 2024): taxonomy grounding for the lenses — most silent
-  bugs surface as wrong outputs, not crashes.
+  Programs" (SANER 2024): most damaging bugs in ML/scientific code are
+  silent wrong outputs, not crashes — why the scope ranks silent
+  wrongness first and why `invariant-attack` is the flagship method.
 - LLM-as-judge calibration surveys (anchored rubrics, position-bias
   mitigation, drift): the basis for the anchored severity rubric and the
   pairwise consistency pass in 06.

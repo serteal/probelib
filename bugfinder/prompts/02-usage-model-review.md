@@ -29,12 +29,10 @@ damage, in this order:
    draft omitted: exports, scripts, CLI hooks, notebook usage.
 4. **Miscalibrated care levels.** Spot-check `normal` modules for evidence
    they feed `critical` outputs (transitive imports from critical paths).
-5. **Wrong domain profile.** Check the declared packs and per-module
-   domain tags against what the modules actually are (an "engineering"
-   tag on a module whose output feeds experiments starves it of the
-   research-grade lenses). Check each generated failure signature traces
-   to a real invariant or code path — a fabricated signature sends every
-   future hypothesis agent hunting a phantom.
+5. **Ungrounded failure signatures.** Check each signature in the
+   failure-signatures section traces to a real invariant or code path —
+   the round planner turns these into focus questions, so a fabricated
+   signature sends future rounds hunting a phantom.
 6. **Overconfident claims.** Spot-check ~10 cited claims verbatim against
    the code; flag any that misquote or overstate.
 
